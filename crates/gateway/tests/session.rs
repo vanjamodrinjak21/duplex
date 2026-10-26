@@ -34,6 +34,8 @@ enum Script {
     Quick,
     /// "One. " then nothing until cancelled.
     Slow,
+    /// 2000 sentences in one token, then TurnDone at once.
+    Burst,
 }
 
 type ServerTx = mpsc::Sender<Result<ServerMsg, Status>>;
@@ -97,13 +99,19 @@ impl Voice for Svc {
                                     text: t.into(),
                                 }))
                             };
-                            let _ = tx
-                                .send(tok(if matches!(script, Script::Quick) {
-                                    "Hello there. "
-                                } else {
-                                    "One. "
-                                }))
-                                .await;
+                            let first = match script {
+                                Script::Quick => "Hello there. ".to_string(),
+                                Script::Slow => "One. ".to_string(),
+                                Script::Burst => (0..2000).map(|i| format!("S{i}. ")).collect(),
+                            };
+                            let _ = tx.send(tok(&first)).await;
+                            if matches!(script, Script::Burst) {
+                                let done = TurnDone {
+                                    turn_id,
+                                    ..Default::default()
+                                };
+                                let _ = tx.send(smsg(server_msg::Kind::Done(done))).await;
+                            }
                             if matches!(script, Script::Quick) {
                                 tokio::time::sleep(Duration::from_millis(300)).await;
                                 let _ = ev.send(Ev::LlmEnd).await;
@@ -394,4 +402,56 @@ async fn missing_worker_keeps_retrying_until_shutdown() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// Speech after TurnDone while sentences are still queued must drop them, barge-in or not.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_speech_drops_queued_sentences_of_the_previous_turn() {
+    let (ev_tx, mut ev) = mpsc::channel(8192);
+    let (addr, _w) = worker(true, Script::Burst, ev_tx.clone()).await;
+    let speaker = Arc::new(MockSpeaker {
+        block: false,
+        ev: ev_tx,
+        killed: Notify::new(),
+    });
+    let (frames, mut src) = mpsc::channel::<Frame>(256);
+    let shutdown = CancellationToken::new();
+    let s = shutdown.clone();
+    tokio::spawn(async move { run(&addr, &mut src, speaker, DEFAULT_VAD_THRESHOLD, s).await });
+    let (loud, quiet) = (vec![3000i16; FRAME], vec![0i16; FRAME]);
+
+    for _ in 0..10 {
+        frames.send(loud.clone()).await.unwrap();
+    }
+    for _ in 0..25 {
+        frames.send(quiet.clone()).await.unwrap();
+    }
+    while !matches!(next_ev(&mut ev).await, Ev::Spoke(_)) {}
+    for _ in 0..10 {
+        frames.send(loud.clone()).await.unwrap();
+    }
+    loop {
+        if let Ev::Client(ClientMsg {
+            kind: Some(client_msg::Kind::Audio(a)),
+        }) = next_ev(&mut ev).await
+        {
+            if a.turn_id == 2 {
+                break;
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut late = 0;
+    while let Ok(e) = ev.try_recv() {
+        if let Ev::Spoke(t) = e {
+            assert!(t.starts_with('S'), "{t}");
+            late += 1;
+        }
+    }
+    // At most the sentence already handed to the player can still start.
+    assert!(
+        late <= 1,
+        "{late} sentences of turn 1 spoken after turn 2 began"
+    );
+    shutdown.cancel();
 }

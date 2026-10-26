@@ -350,7 +350,6 @@ async fn run_session<F: FrameSource, S: Speaker>(
                             play_turn.store(turn + 1, Ordering::Release);
                             speaker.kill();
                             let barge_in_ms = t0.elapsed().as_millis();
-                            backlog.clear();
                             while let Ok(ev) = ev_rx.try_recv() {
                                 if let Played::Started { turn: t, text, .. } = ev {
                                     if t == turn {
@@ -364,6 +363,8 @@ async fn run_session<F: FrameSource, S: Speaker>(
                             out.send(client(client_msg::Kind::Cancel(c))).await.context("send Cancel")?;
                             barged = Some(Barged { turn, span: (span, t0), barge_in_ms, stats: std::mem::take(&mut stats) });
                         }
+                        // Leftover sentences of the old turn must never be sent under the new turn id.
+                        backlog.clear();
                         turn += 1;
                         seq = 0;
                         play_turn.store(turn, Ordering::Release);
