@@ -74,6 +74,8 @@ impl Service {
 const MAX_PCM_BYTES: usize = 16_000 * 2 * 60;
 /// Last 6 user+assistant pairs.
 const MAX_HISTORY: usize = 12;
+/// `Cancel.spoken_text` beyond this many bytes is cut before it enters history.
+const MAX_SPOKEN_BYTES: usize = 4096;
 
 type Out = Pin<Box<dyn Stream<Item = Result<ServerMsg, Status>> + Send>>;
 /// (user transcript, assistant reply) of a turn that got past STT.
@@ -90,6 +92,18 @@ struct Turn {
 #[allow(clippy::result_large_err)] // tonic::Status is what the stream item carries
 fn msg(k: server_msg::Kind) -> Result<ServerMsg, Status> {
     Ok(ServerMsg { kind: Some(k) })
+}
+
+/// Truncates `s` to at most `max` bytes, on a char boundary.
+fn cap(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
 }
 
 /// Waits for a (cancelled or finished) turn and appends it to history.
@@ -160,7 +174,7 @@ impl Voice for Service {
                         pcm.clear();
                         match &mut current {
                             Some(t) if t.id == c.turn_id => {
-                                t.spoken = Some(c.spoken_text);
+                                t.spoken = Some(cap(c.spoken_text, MAX_SPOKEN_BYTES));
                                 t.token.cancel();
                                 // The turn already sent its TurnDone; ack so the gateway can close its cancel span.
                                 if t.handle.is_finished() {
@@ -557,5 +571,86 @@ mod tests {
             "{seen:?}"
         );
         assert!(!seen.iter().any(|k| matches!(k, server_msg::Kind::Error(_))));
+    }
+
+    /// Floods tokens with no delay until cancelled; signals `stopped` when it returns.
+    struct FloodLlm {
+        stopped: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl Llm for FloodLlm {
+        async fn stream(
+            &self,
+            _: Vec<String>,
+            tx: mpsc::Sender<String>,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<()> {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    r = tx.send("tok".into()) => if r.is_err() { break },
+                }
+            }
+            self.stopped.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_with_full_outbound_channel_ends_turn() {
+        let llm = Arc::new(FloodLlm {
+            stopped: tokio::sync::Notify::new(),
+        });
+        let mut c = start_with(llm.clone()).await;
+        let (tx, mut out) = open(&mut c).await;
+        utter(&tx, 1).await;
+        // Not reading `out` lets the outbound channel and the transport buffers fill up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send(send(client_msg::Kind::Cancel(Cancel {
+            turn_id: 1,
+            reason: 0,
+            spoken_text: String::new(),
+        })))
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            llm.stopped.notified().await;
+            let seen = until_done(&mut out, 1).await;
+            assert!(matches!(seen.last(), Some(server_msg::Kind::Done(d)) if d.cancelled));
+        })
+        .await
+        .expect("turn did not end within 2 s of cancel");
+    }
+
+    #[test]
+    fn cap_cuts_on_char_boundary() {
+        let s = format!("a{}", "é".repeat(3000));
+        assert_eq!(cap(s, MAX_SPOKEN_BYTES).len(), MAX_SPOKEN_BYTES - 1);
+        assert_eq!(cap("short".into(), MAX_SPOKEN_BYTES), "short");
+    }
+
+    #[tokio::test]
+    async fn oversized_spoken_text_is_capped_in_history() {
+        let llm = MockLlm::new(3, 50);
+        let mut c = start_with(llm.clone()).await;
+        let (tx, mut out) = open(&mut c).await;
+        utter(&tx, 1).await;
+        loop {
+            if let Some(server_msg::Kind::Token(_)) = out.next().await.unwrap().unwrap().kind {
+                break;
+            }
+        }
+        tx.send(send(client_msg::Kind::Cancel(Cancel {
+            turn_id: 1,
+            reason: 0,
+            spoken_text: "x".repeat(MAX_SPOKEN_BYTES * 4),
+        })))
+        .await
+        .unwrap();
+        until_done(&mut out, 1).await;
+        utter(&tx, 2).await;
+        until_done(&mut out, 2).await;
+        assert_eq!(llm.prompts.lock().unwrap()[1][1].len(), MAX_SPOKEN_BYTES);
     }
 }
