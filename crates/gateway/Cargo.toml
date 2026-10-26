@@ -8,6 +8,7 @@ anyhow.workspace = true
 cpal = "0.18.2"
 duplex-proto = { path = "../../proto" }
 hound = "3.5.1"
+kokoro-en = "0.1.5"
 rtrb = "0.4.1"
 rubato = "0.15"
 tokio.workspace = true

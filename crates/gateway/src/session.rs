@@ -1,6 +1,7 @@
 //! Session loop: VAD-gated audio streaming, sentence TTS, barge-in, health-gated reconnect.
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -27,6 +28,10 @@ pub trait Speaker: Send + Sync + 'static {
     fn speak(&self, text: String) -> impl Future<Output = ()> + Send;
     /// Stops the sentence being spoken now.
     fn kill(&self);
+    /// True if the next sentence may be handed over while the current one is still being spoken.
+    fn lookahead(&self) -> bool {
+        false
+    }
 }
 
 /// macOS `say`, one child process per sentence.
@@ -156,30 +161,46 @@ enum Played {
     },
 }
 
-/// Speaks queued sentences one at a time, skipping any whose turn was barged in.
+/// Speaks queued sentences in order, skipping any whose turn was barged in.
+/// With `lookahead` the next sentence is handed over while the current one plays.
 async fn player<S: Speaker>(
     speaker: Arc<S>,
     mut rx: mpsc::Receiver<(u64, String)>,
     current: Arc<AtomicU64>,
     ev: mpsc::Sender<Played>,
 ) {
-    while let Some((turn, text)) = rx.recv().await {
-        if turn != current.load(Ordering::Acquire) {
-            continue;
+    let limit = if speaker.lookahead() { 2 } else { 1 };
+    let mut active: VecDeque<Pin<Box<dyn Future<Output = u64> + Send + '_>>> = VecDeque::new();
+    let mut closed = false;
+    while !closed || !active.is_empty() {
+        tokio::select! {
+            biased;
+            turn = async { active.front_mut().unwrap().await }, if !active.is_empty() => {
+                active.pop_front();
+                let _ = ev.send(Played::Finished { turn }).await;
+            }
+            m = rx.recv(), if !closed && active.len() < limit => {
+                let Some((turn, text)) = m else {
+                    closed = true;
+                    continue;
+                };
+                if turn != current.load(Ordering::Acquire) {
+                    continue;
+                }
+                if ev
+                    .send(Played::Started { turn, text: text.clone(), at: Instant::now() })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let spoken = speaker.speak(text);
+                active.push_back(Box::pin(async move {
+                    spoken.await;
+                    turn
+                }));
+            }
         }
-        if ev
-            .send(Played::Started {
-                turn,
-                text: text.clone(),
-                at: Instant::now(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        speaker.speak(text).await;
-        let _ = ev.send(Played::Finished { turn }).await;
     }
 }
 
@@ -196,7 +217,7 @@ fn audio(turn_id: u64, seq: u64, frame: &[i16]) -> ClientMsg {
 }
 
 /// Logs `ms` inside a span opened at `t`.
-fn close(span: Option<(Span, Instant)>) {
+pub(crate) fn close(span: Option<(Span, Instant)>) {
     if let Some((s, t)) = span {
         s.in_scope(|| tracing::info!(ms = t.elapsed().as_millis() as u64, "span closed"));
     }
