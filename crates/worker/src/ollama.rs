@@ -228,7 +228,7 @@ mod tests {
             .iter()
             .map(|m| m["role"].as_str().unwrap())
             .collect();
-        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert_eq!(roles, ["system", "user", "assistant", "user"]);
     }
 
     #[tokio::test]
