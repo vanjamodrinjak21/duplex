@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn")),
         )
         .init();
     let addr = std::env::var("WORKER_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".into());
@@ -74,6 +74,7 @@ async fn pick_speaker() -> anyhow::Result<(AnySpeaker, Option<cpal::Stream>)> {
     let say = || AnySpeaker::Say(SaySpeaker::new(std::env::var("SAY_VOICE").ok()));
     let want = parse_tts(std::env::var("TTS").ok().as_deref())?;
     if want == Some(Tts::Say) {
+        tracing::info!("tts=say");
         return Ok((say(), None));
     }
     let model = env("KOKORO_MODEL", "models/kokoro-v1.0.int8.onnx");
@@ -86,17 +87,21 @@ async fn pick_speaker() -> anyhow::Result<(AnySpeaker, Option<cpal::Stream>)> {
             want.is_none(),
             "TTS=kokoro but {missing} is missing (see AGENTS.md for the download commands)"
         );
-        tracing::warn!("{missing} not found; using say instead of Kokoro");
+        tracing::warn!("{missing} not found; using say instead of Kokoro (see AGENTS.md; paths are relative to the cwd)");
+        tracing::info!("tts=say");
         return Ok((say(), None));
     }
     let speed = match std::env::var("KOKORO_SPEED") {
-        Ok(v) => v
-            .parse()
-            .with_context(|| format!("KOKORO_SPEED={v} is not a number"))?,
+        Ok(v) => match v.parse::<f32>() {
+            Ok(x) if x.is_finite() && x > 0.0 => x,
+            _ => anyhow::bail!("KOKORO_SPEED={v} must be a number above 0"),
+        },
         Err(_) => 1.0,
     };
-    let synth = KokoroSynth::new(&model, &voices, &env("KOKORO_VOICE", "af_heart"), speed).await?;
+    let voice = env("KOKORO_VOICE", "af_heart");
+    let synth = KokoroSynth::new(&model, &voices, &voice, speed).await?;
     let (speaker, stream) = KokoroSpeaker::start(synth)?;
     speaker.prewarm().await?;
+    tracing::info!(%voice, speed, "tts=kokoro");
     Ok((AnySpeaker::Kokoro(speaker), Some(stream)))
 }

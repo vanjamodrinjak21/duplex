@@ -17,8 +17,11 @@ Env vars (defaults in brackets):
 - Worker: `WORKER_ADDR` [`127.0.0.1:50051`], `WHISPER_MODEL` (required, path to `ggml-small.bin`), `OLLAMA_URL` [`http://localhost:11434`], `OLLAMA_MODEL` [`qwen2.5:3b`].
 - Gateway: `WORKER_ADDR` [`http://127.0.0.1:50051`], `SAY_VOICE` [system voice], `VAD_THRESHOLD` [500, RMS of i16 samples], `FAKE_MIC` [unset; path to a 16 kHz mono s16 WAV replaces the mic].
 - Gateway TTS: `TTS` [`kokoro` if the model files exist, else a warning and `say`; `kokoro` | `say`, anything else is a startup error], `KOKORO_MODEL` [`models/kokoro-v1.0.int8.onnx`, relative to cwd], `KOKORO_VOICES` [`models/voices`, a directory of per-voice `.bin` files], `KOKORO_VOICE` [`af_heart`], `KOKORO_SPEED` [1.0]. TTS is Kokoro in the gateway (`crates/gateway/src/tts.rs`, crate `kokoro-en`); `say` is the fallback.
-- Kokoro files (from the repo root, about 120 MB, the layout `kokoro-en` expects):
-  `mkdir -p models/voices && cd models && curl -L -o kokoro-v1.0.int8.onnx https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx` then one `curl -L -O` per voice from `https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/<name>.bin` into `models/voices/` (`af_heart` is the default; `af_bella`, `am_adam`, `bf_emma` also work). The fp32 `onnx/model.onnx` (~325 MB) also loads.
+- Kokoro files (about 120 MB with all voices, the layout `kokoro-en` expects; run from the repo root):
+  `mkdir -p models/voices`
+  `curl -L -o models/kokoro-v1.0.int8.onnx https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx`
+  `curl -L -o models/voices/af_heart.bin https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/af_heart.bin`
+  `af_heart.bin` alone is enough for the default; fetch any other `voices/<name>.bin` the same way and select it with `KOKORO_VOICE`. The fp32 `onnx/model.onnx` (~325 MB) also loads. `ort` is pinned to `=2.0.0-rc.13` in `crates/gateway/Cargo.toml` (kokoro-en breaks on newer rc).
 - German: Kokoro v1.0 has no German voice; use `TTS=say SAY_VOICE=Anna`. There is no language detection.
 
 Commands (from the repo root, with `CARGO_TARGET_DIR` exported):

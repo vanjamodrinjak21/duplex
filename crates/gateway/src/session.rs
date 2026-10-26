@@ -161,8 +161,16 @@ enum Played {
     },
 }
 
+/// A sentence handed to the speaker: its future, plus what `Started` reports once it is the one playing.
+struct Queued<'a> {
+    turn: u64,
+    text: String,
+    fut: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+}
+
 /// Speaks queued sentences in order, skipping any whose turn was barged in.
-/// With `lookahead` the next sentence is handed over while the current one plays.
+/// With `lookahead` the next sentence is handed over while the current one plays,
+/// but `Started` is only sent when it becomes the current one.
 async fn player<S: Speaker>(
     speaker: Arc<S>,
     mut rx: mpsc::Receiver<(u64, String)>,
@@ -170,14 +178,24 @@ async fn player<S: Speaker>(
     ev: mpsc::Sender<Played>,
 ) {
     let limit = if speaker.lookahead() { 2 } else { 1 };
-    let mut active: VecDeque<Pin<Box<dyn Future<Output = u64> + Send + '_>>> = VecDeque::new();
+    let started = |q: &Queued| Played::Started {
+        turn: q.turn,
+        text: q.text.clone(),
+        at: Instant::now(),
+    };
+    let mut active: VecDeque<Queued> = VecDeque::new();
     let mut closed = false;
     while !closed || !active.is_empty() {
         tokio::select! {
             biased;
-            turn = async { active.front_mut().unwrap().await }, if !active.is_empty() => {
-                active.pop_front();
-                let _ = ev.send(Played::Finished { turn }).await;
+            () = async { active.front_mut().unwrap().fut.as_mut().await }, if !active.is_empty() => {
+                let done = active.pop_front().unwrap();
+                let _ = ev.send(Played::Finished { turn: done.turn }).await;
+                if let Some(q) = active.front() {
+                    if ev.send(started(q)).await.is_err() {
+                        return;
+                    }
+                }
             }
             m = rx.recv(), if !closed && active.len() < limit => {
                 let Some((turn, text)) = m else {
@@ -187,18 +205,11 @@ async fn player<S: Speaker>(
                 if turn != current.load(Ordering::Acquire) {
                     continue;
                 }
-                if ev
-                    .send(Played::Started { turn, text: text.clone(), at: Instant::now() })
-                    .await
-                    .is_err()
-                {
+                let q = Queued { turn, text: text.clone(), fut: Box::pin(speaker.speak(text)) };
+                if active.is_empty() && ev.send(started(&q)).await.is_err() {
                     return;
                 }
-                let spoken = speaker.speak(text);
-                active.push_back(Box::pin(async move {
-                    spoken.await;
-                    turn
-                }));
+                active.push_back(q);
             }
         }
     }
@@ -442,5 +453,47 @@ mod tests {
     fn backoff_doubles_and_caps() {
         let ms: Vec<u128> = (0..8).map(|n| backoff(n).as_millis()).collect();
         assert_eq!(ms, [100, 200, 400, 800, 1600, 2000, 2000, 2000]);
+    }
+
+    /// Speaker whose `speak` records when it is called and then "plays" for 200 ms.
+    struct Slow(std::sync::Mutex<Vec<Instant>>);
+
+    impl Speaker for Slow {
+        fn speak(&self, _text: String) -> impl Future<Output = ()> + Send {
+            self.0.lock().unwrap().push(Instant::now());
+            tokio::time::sleep(Duration::from_millis(200))
+        }
+        fn kill(&self) {}
+        fn lookahead(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn player_hands_over_next_sentence_early_but_starts_it_late() {
+        let sp = Arc::new(Slow(Default::default()));
+        let (tx, rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(8);
+        tokio::spawn(player(sp.clone(), rx, Arc::new(AtomicU64::new(0)), ev_tx));
+        tx.send((0, "one".into())).await.unwrap();
+        tx.send((0, "two".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sp.0.lock().unwrap().len(), 2, "speak called for both");
+        let mut seen = Vec::new();
+        while let Ok(e) = ev_rx.try_recv() {
+            seen.push(match e {
+                Played::Started { text, .. } => format!("start {text}"),
+                Played::Finished { .. } => "finish".into(),
+            });
+        }
+        assert_eq!(seen, ["start one"], "two has not started playing yet");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let Some(Played::Finished { .. }) = ev_rx.recv().await else {
+            panic!("expected finish")
+        };
+        let Some(Played::Started { text, .. }) = ev_rx.recv().await else {
+            panic!("expected start")
+        };
+        assert_eq!(text, "two");
     }
 }

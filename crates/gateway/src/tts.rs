@@ -52,10 +52,16 @@ impl Synth for KokoroSynth {
 
     /// Must run off the async runtime threads (it blocks on the engine's future).
     fn synth(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        match self.rt.block_on(self.tts.synth(text, self.voice.clone())) {
+        // kokoro-en passes unknown words to `espeak-ng` as argv, so a leading '-' would be read as an option.
+        let text = text
+            .split_whitespace()
+            .map(|w| w.trim_start_matches('-'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        match self.rt.block_on(self.tts.synth(&text, self.voice.clone())) {
             Ok((samples, _)) => Ok(samples),
             Err(kokoro_en::KokoroError::VoiceNotFound(v)) => {
-                bail!("KOKORO_VOICE={v} is not in the voices file (try {VOICE_HINT})")
+                bail!("KOKORO_VOICE={v} is not in the voices file (try a name from the voices in KOKORO_VOICES, e.g. {VOICE_HINT})")
             }
             Err(e) => Err(e.into()),
         }
@@ -95,6 +101,7 @@ struct Shared {
 
 /// Output callback body. REAL-TIME: no allocation, locks or logging; only ring pops and atomics.
 fn fill(cons: &mut Consumer<f32>, shared: &Shared, seen_gen: &mut u64, out: &mut [f32]) {
+    // A sentence pushed after `kill()` but before this first post-kill run is drained too; rare, synthesis is slow.
     let g = shared.gen.load(Ordering::Acquire);
     if g != *seen_gen {
         *seen_gen = g;
@@ -227,11 +234,13 @@ impl<Y: Synth> KokoroSpeaker<Y> {
         span: &mut Option<(tracing::Span, Instant)>,
     ) -> bool {
         while !samples.is_empty() {
-            if self.shared.gen.load(Ordering::Acquire) != gen {
-                return false;
-            }
             let n = {
+                // A poisoned lock means another thread already panicked.
                 let mut prod = self.prod.lock().unwrap();
+                // Checked under the lock: `kill()` bumps `gen` under it too, so no stale write follows a drain.
+                if self.shared.gen.load(Ordering::Acquire) != gen {
+                    return false;
+                }
                 let n = samples.len().min(prod.slots()) / self.channels * self.channels;
                 if let Ok(chunk) = prod.write_chunk_uninit(n) {
                     chunk.fill_from_iter(samples[..n].iter().copied());
@@ -266,16 +275,19 @@ impl<Y: Synth> Speaker for KokoroSpeaker<Y> {
             ticket,
         };
         let (synth, rate, channels) = (self.synth.clone(), self.rate, self.channels);
+        // Started here, not on first poll, so the next sentence synthesizes while the previous one is still polled.
+        // A kill cannot stop a synth already running; it only discards the result.
+        let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
+            let mono = resample(&synth.synth(&text)?, Y::SAMPLE_RATE, rate)?;
+            Ok(mono
+                .iter()
+                .flat_map(|&s| std::iter::repeat_n(s, channels))
+                .collect())
+        });
         async move {
-            let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<f32>> {
-                let mono = resample(&synth.synth(&text)?, Y::SAMPLE_RATE, rate)?;
-                Ok(mono
-                    .iter()
-                    .flat_map(|&s| std::iter::repeat_n(s, channels))
-                    .collect())
-            });
             let samples = tokio::select! {
                 biased;
+                // `until` with a false condition only returns (false) once killed.
                 false = self.until(gen, || false) => return,
                 r = job => r,
             };
@@ -291,8 +303,9 @@ impl<Y: Synth> Speaker for KokoroSpeaker<Y> {
             {
                 return;
             }
-            drop(turn);
+            // Exact: nobody else pushes until `turn` drops.
             let target = self.pushed.load(Ordering::Acquire);
+            drop(turn);
             self.until(gen, || {
                 self.shared.consumed.load(Ordering::Relaxed) >= target
             })
@@ -301,6 +314,8 @@ impl<Y: Synth> Speaker for KokoroSpeaker<Y> {
     }
 
     fn kill(&self) {
+        // Under the producer lock so an in-progress `push` finishes first and the next one sees the new generation.
+        let _prod = self.prod.lock().unwrap();
         self.shared.gen.fetch_add(1, Ordering::AcqRel);
         // Every ticket handed out so far is void.
         self.serving
@@ -416,20 +431,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_sentence_synthesizes_while_previous_is_unconsumed() {
+    async fn next_sentence_synthesizes_without_being_polled() {
         let mock = Arc::new(Mock::new(2400, 200));
         let (sp, cons) = KokoroSpeaker::with_ring(mock.clone(), 24_000, 1);
+        // `b` is only created, never polled, like a queued lookahead future in `player`.
+        let b = sp.speak("b".into());
         let check = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            // `a` is pushed but nobody consumes it; `b` must already be synthesizing.
-            assert!(cons.slots() >= 2400);
-            let calls = mock.calls.lock().unwrap();
-            assert_eq!(calls.len(), 2);
-            assert!(calls[1].1.duration_since(calls[0].1) < Duration::from_millis(100));
-            drop(calls);
-            sp.kill();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                mock.calls.lock().unwrap().len(),
+                1,
+                "synth starts at hand-over"
+            );
+            drop(b);
         };
-        tokio::join!(sp.speak("a".into()), sp.speak("b".into()), check);
+        tokio::join!(check);
+        assert_eq!(cons.slots(), 0);
     }
 
     #[test]
