@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow.workspace = true
+cpal = "0.18.2"
 duplex-proto = { path = "../../proto" }
+hound = "3.5.1"
+rtrb = "0.4.1"
+rubato = "0.15"
 tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
