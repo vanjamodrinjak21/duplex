@@ -14,7 +14,8 @@ fn env_or(key: &str, default: &str) -> String {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,whisper_rs=warn")),
         )
         .with_span_events(FmtSpan::CLOSE)
         .init();
@@ -23,6 +24,8 @@ async fn main() -> anyhow::Result<()> {
         .context("WORKER_ADDR is not a host:port")?;
     let model = std::env::var("WHISPER_MODEL")
         .map_err(|_| anyhow::anyhow!("WHISPER_MODEL is not set (path to ggml-small.bin)"))?;
+    // whisper.cpp/ggml would otherwise print straight to stderr.
+    whisper_rs::install_logging_hooks();
     let stt = tokio::task::spawn_blocking(move || WhisperStt::load(&model)).await??;
     let llm = OllamaLlm::new(
         env_or("OLLAMA_URL", "http://localhost:11434"),

@@ -10,6 +10,8 @@ use crate::Llm;
 
 /// Keeps the model resident between turns so TTFT stays low.
 pub const KEEP_ALIVE: &str = "30m";
+/// An NDJSON line longer than this is an error rather than unbounded buffering.
+const MAX_LINE_BYTES: usize = 1 << 20;
 
 pub struct OllamaLlm {
     pub url: String,
@@ -107,6 +109,10 @@ impl Llm for OllamaLlm {
                     return Ok(());
                 }
             }
+            anyhow::ensure!(
+                buf.len() <= MAX_LINE_BYTES,
+                "ollama: NDJSON line exceeds {MAX_LINE_BYTES} bytes"
+            );
         }
     }
 }
@@ -240,5 +246,28 @@ mod tests {
             .stream(vec!["hi".into()], tx, CancellationToken::new())
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_an_error() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut b = [0u8; 4096];
+            let _ = s.read(&mut b).await;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n").await;
+            // One endless line with no newline.
+            let chunk = vec![b'x'; 64 * 1024];
+            while s.write_all(&chunk).await.is_ok() {}
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            OllamaLlm::new(url, "m".into()).stream(vec!["hi".into()], tx, CancellationToken::new()),
+        )
+        .await
+        .expect("stream() hung on an oversized line");
+        assert!(r.is_err());
     }
 }

@@ -21,6 +21,24 @@ See `AGENTS.md` for all environment variables.
 | TTFA (end of speech to `say` started) | to be measured |
 | Barge-in (speech detected to `say` killed) | to be measured |
 
+## Measuring
+
+Run the worker and the gateway in two terminals, headphones on, and save the gateway's stdout:
+
+```sh
+export CARGO_TARGET_DIR=$HOME/.cache/duplex-target
+WHISPER_MODEL=models/ggml-small.bin cargo run --release -p worker
+cargo run --release -p gateway | tee run.log
+```
+
+Talk for a few turns, interrupting some replies, then stop with Ctrl-C. Each turn prints one stdout line: `ttfa_ms=` is end of speech to `say` started, and barged-in turns add `barge_in_ms=` (speech detected to `say` killed). Medians of both fields:
+
+```sh
+for f in ttfa_ms barge_in_ms; do grep -o "$f=[0-9]*" run.log | cut -d= -f2 | sort -n | awk -v f=$f '{a[NR]=$1} END {if (NR) print f, (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2), "n=" NR}'; done
+```
+
+Paste the medians into the Results table above.
+
 ## Limitations
 
 - Headphones required: there is no echo cancellation, so speaker output would trigger barge-in.
