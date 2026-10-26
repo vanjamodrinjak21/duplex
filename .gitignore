@@ -4,3 +4,5 @@ docs/
 models/
 target/
 .env
+factory/jobs/
+factory/backlog.md
