@@ -449,6 +449,30 @@ mod tests {
         assert_eq!(cons.slots(), 0);
     }
 
+    #[tokio::test]
+    async fn player_overlaps_real_speaker_synthesis() {
+        let mock = Arc::new(Mock::new(2400, 200));
+        let (sp, cons) = KokoroSpeaker::with_ring(mock.clone(), 24_000, 1);
+        let sp = Arc::new(sp);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (ev, _ev_rx) = tokio::sync::mpsc::channel(8);
+        let p = tokio::spawn(crate::session::player(
+            sp.clone(),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            ev,
+        ));
+        tx.send((0, "a".into())).await.unwrap();
+        tx.send((0, "b".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Nothing is consumed and `a` is still synthesizing, yet `b` has started.
+        assert_eq!(cons.slots(), 0);
+        assert_eq!(mock.calls.lock().unwrap().len(), 2);
+        sp.kill();
+        drop(tx);
+        p.await.unwrap();
+    }
+
     #[test]
     fn kill_silences_within_one_callback() {
         let (sp, mut cons) = KokoroSpeaker::with_ring(Arc::new(Mock::new(0, 0)), 24_000, 1);

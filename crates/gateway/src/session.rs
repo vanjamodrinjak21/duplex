@@ -150,7 +150,7 @@ pub async fn run<F: FrameSource, S: Speaker>(
     }
 }
 
-enum Played {
+pub(crate) enum Played {
     Started {
         turn: u64,
         text: String,
@@ -171,7 +171,7 @@ struct Queued<'a> {
 /// Speaks queued sentences in order, skipping any whose turn was barged in.
 /// With `lookahead` the next sentence is handed over while the current one plays,
 /// but `Started` is only sent when it becomes the current one.
-async fn player<S: Speaker>(
+pub(crate) async fn player<S: Speaker>(
     speaker: Arc<S>,
     mut rx: mpsc::Receiver<(u64, String)>,
     current: Arc<AtomicU64>,
