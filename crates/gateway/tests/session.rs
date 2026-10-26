@@ -455,3 +455,34 @@ async fn new_speech_drops_queued_sentences_of_the_previous_turn() {
     );
     shutdown.cancel();
 }
+
+#[tokio::test]
+async fn stream_drop_kills_speaker() {
+    let (ev_tx, mut ev) = mpsc::channel(4096);
+    let (addr, w) = worker(true, Script::Slow, ev_tx.clone()).await;
+    let speaker = Arc::new(MockSpeaker {
+        block: true,
+        ev: ev_tx,
+        killed: Notify::new(),
+    });
+    let (frames, mut src) = mpsc::channel::<Frame>(256);
+    let shutdown = CancellationToken::new();
+    let s = shutdown.clone();
+    tokio::spawn(async move { run(&addr, &mut src, speaker, DEFAULT_VAD_THRESHOLD, s).await });
+    let (loud, quiet) = (vec![3000i16; FRAME], vec![0i16; FRAME]);
+    for _ in 0..10 {
+        frames.send(loud.clone()).await.unwrap();
+    }
+    for _ in 0..25 {
+        frames.send(quiet.clone()).await.unwrap();
+    }
+    while !matches!(next_ev(&mut ev).await, Ev::Spoke(_)) {}
+
+    // Drop the stream while "One." is still being spoken.
+    let tx = w.server_tx.lock().unwrap().clone().unwrap();
+    tx.send(Err(Status::unavailable("worker gone")))
+        .await
+        .unwrap();
+    while !matches!(next_ev(&mut ev).await, Ev::Killed) {}
+    shutdown.cancel();
+}

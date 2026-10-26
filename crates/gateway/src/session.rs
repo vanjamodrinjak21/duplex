@@ -46,6 +46,8 @@ impl SaySpeaker {
 
 impl Speaker for SaySpeaker {
     async fn speak(&self, text: String) {
+        // `say` has no first-sample signal; spawn is the closest measurable point.
+        let span = Some((tracing::info_span!("tts_first_audio"), Instant::now()));
         // shortcut: a kill() that lands before this subscribe is missed; the player already skips stale turns, so at most one sentence leaks.
         let mut killed = self.kills.subscribe();
         let mut cmd = tokio::process::Command::new("say");
@@ -57,6 +59,7 @@ impl Speaker for SaySpeaker {
             Ok(c) => c,
             Err(e) => return tracing::warn!("say: {e}"),
         };
+        close(span);
         tokio::select! {
             biased;
             _ = killed.changed() => { let _ = child.kill().await; }
@@ -99,11 +102,17 @@ pub async fn connect_healthy(
             Ok(c) => return Some(c),
             Err(e) => {
                 let wait = backoff(attempt);
+                // A failed connect (not an unhealthy reply) usually means the worker was never started.
+                let hint = if e.downcast_ref::<tonic::transport::Error>().is_some() {
+                    "; is the worker running? start it with cargo run -p worker"
+                } else {
+                    ""
+                };
                 tracing::warn!(
                     attempt,
                     addr,
                     retry_in_ms = wait.as_millis() as u64,
-                    "worker not ready: {e:#}"
+                    "worker not ready: {e:#}{hint}"
                 );
                 attempt += 1;
                 tokio::select! {
@@ -127,7 +136,11 @@ pub async fn run<F: FrameSource, S: Speaker>(
     while let Some(client) = connect_healthy(addr, &shutdown).await {
         match run_session(client, src, speaker.clone(), threshold, &shutdown).await {
             Ok(()) => return,
-            Err(e) => tracing::warn!("worker stream lost: {e:#}; reconnecting"),
+            Err(e) => {
+                // Silence an in-flight `say` so it does not talk across the reconnect.
+                speaker.kill();
+                tracing::warn!("worker stream lost: {e:#}; reconnecting");
+            }
         }
     }
 }
