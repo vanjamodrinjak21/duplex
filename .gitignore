@@ -1,0 +1,6 @@
+.claude/
+.remember/
+docs/
+models/
+target/
+.env
