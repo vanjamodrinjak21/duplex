@@ -2,6 +2,7 @@
 name = "gateway"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
 [features]
 # Opt-in candle Kokoro (any-tts), Metal or Accelerate CPU. Its `kokoro` feature pulls lindera with

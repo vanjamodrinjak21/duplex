@@ -1,5 +1,7 @@
 # duplex
 
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 A local full-duplex voice loop for macOS: speak into the mic, a Rust worker transcribes with whisper.cpp (Metal) and streams a reply from Ollama, and the gateway speaks it sentence by sentence, stopping the moment you interrupt.
 
 ## Run it
@@ -47,3 +49,21 @@ Paste the medians into the Results table above.
 - With `TTS=say`, `say` starts per sentence as a new process, which adds its own startup latency to TTFA.
 - If the TTS engine fails on one sentence, that sentence is skipped with a warning on stderr (a silent gap).
 - Ollama serialises requests by default, so concurrent sessions queue behind each other.
+
+## How it works
+
+Two Rust processes talk over one gRPC bidirectional stream. The gateway captures the mic, runs a voice-activity detector, streams 20 ms frames, buffers tokens into sentences and plays them. The worker transcribes with whisper.cpp, streams tokens from Ollama and keeps per-turn history. Interrupting cancels a per-turn token end to end: playback stops, `Cancel` goes to the worker, and any late token for the old turn is dropped. Audio-in is the only lossy edge (drop oldest); everything downstream is bounded and awaits.
+
+Voices: `TTS=kokoro` (default, neural, via `kokoro-en`), `TTS=anytts` (optional pure-Rust candle backend, feature-gated) or `TTS=say` (macOS). Kokoro has no German voice yet; use `TTS=say SAY_VOICE=Anna` for German.
+
+## Status
+
+Work in progress. The loop, barge-in and the tests run headless; live latency numbers are not published yet (see Results). Not tested: Windows or Linux, echo cancellation, more than one session.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). The worker has no authentication and must stay on localhost.
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
