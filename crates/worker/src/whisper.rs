@@ -8,7 +8,9 @@ use std::sync::{
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
+};
 
 use crate::Stt;
 
@@ -22,7 +24,9 @@ impl WhisperStt {
         let ctx = WhisperContext::new_with_params(path, WhisperContextParameters::default())
             .map_err(|e| anyhow!("WHISPER_MODEL={path}: cannot load model: {e}"))?;
         let state = ctx.create_state().context("whisper state")?;
-        Ok(Self { state: Arc::new(Mutex::new(state)) })
+        Ok(Self {
+            state: Arc::new(Mutex::new(state)),
+        })
     }
 }
 
@@ -32,7 +36,11 @@ unsafe extern "C" fn abort_cb(data: *mut c_void) -> bool {
 
 #[async_trait]
 impl Stt for WhisperStt {
-    async fn transcribe(&self, pcm: Vec<u8>, cancel: CancellationToken) -> anyhow::Result<Option<(String, String)>> {
+    async fn transcribe(
+        &self,
+        pcm: Vec<u8>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Option<(String, String)>> {
         let abort = Arc::new(AtomicBool::new(false));
         let watcher = tokio::spawn({
             let (abort, cancel) = (abort.clone(), cancel.clone());
@@ -44,7 +52,10 @@ impl Stt for WhisperStt {
         let state = self.state.clone();
         let flag = abort.clone();
         let res = tokio::task::spawn_blocking(move || {
-            let audio: Vec<f32> = pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
+            let audio: Vec<f32> = pcm
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+                .collect();
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some("auto"));
             params.set_print_progress(false);
@@ -56,10 +67,17 @@ impl Stt for WhisperStt {
                 params.set_abort_callback(Some(abort_cb));
                 params.set_abort_callback_user_data(Arc::as_ptr(&flag) as *mut c_void);
             }
-            let mut st = state.lock().map_err(|_| anyhow!("whisper state poisoned"))?;
+            let mut st = state
+                .lock()
+                .map_err(|_| anyhow!("whisper state poisoned"))?;
             st.full(params, &audio).context("whisper inference")?;
-            let text: String = st.as_iter().filter_map(|s| s.to_str_lossy().ok().map(|t| t.into_owned())).collect();
-            let lang = whisper_rs::get_lang_str(st.full_lang_id_from_state()).unwrap_or("").to_string();
+            let text: String = st
+                .as_iter()
+                .filter_map(|s| s.to_str_lossy().ok().map(|t| t.into_owned()))
+                .collect();
+            let lang = whisper_rs::get_lang_str(st.full_lang_id_from_state())
+                .unwrap_or("")
+                .to_string();
             anyhow::Ok((text.trim().to_string(), lang))
         })
         .await;
@@ -79,7 +97,9 @@ mod tests {
     fn fixture(name: &str) -> Vec<u8> {
         let path = format!("{}/../../fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
         let r = hound::WavReader::open(path).unwrap();
-        r.into_samples::<i16>().flat_map(|s| s.unwrap().to_le_bytes()).collect()
+        r.into_samples::<i16>()
+            .flat_map(|s| s.unwrap().to_le_bytes())
+            .collect()
     }
 
     fn stt() -> WhisperStt {
@@ -90,10 +110,18 @@ mod tests {
     #[ignore = "needs WHISPER_MODEL"]
     async fn detects_en_and_de() {
         let s = stt();
-        let (text, lang) = s.transcribe(fixture("en.wav"), CancellationToken::new()).await.unwrap().unwrap();
+        let (text, lang) = s
+            .transcribe(fixture("en.wav"), CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(lang, "en");
         assert!(!text.is_empty());
-        let (_, lang) = s.transcribe(fixture("de.wav"), CancellationToken::new()).await.unwrap().unwrap();
+        let (_, lang) = s
+            .transcribe(fixture("de.wav"), CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(lang, "de");
     }
 
@@ -103,7 +131,10 @@ mod tests {
         let s = stt();
         let pcm = fixture("en.wav");
         let t = Instant::now();
-        s.transcribe(pcm.clone(), CancellationToken::new()).await.unwrap().unwrap();
+        s.transcribe(pcm.clone(), CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
         let full = t.elapsed();
         let cancel = CancellationToken::new();
         tokio::spawn({
@@ -115,6 +146,10 @@ mod tests {
         });
         let t = Instant::now();
         assert!(s.transcribe(pcm, cancel).await.unwrap().is_none());
-        assert!(t.elapsed() < full, "cancelled {:?} vs full {full:?}", t.elapsed());
+        assert!(
+            t.elapsed() < full,
+            "cancelled {:?} vs full {full:?}",
+            t.elapsed()
+        );
     }
 }

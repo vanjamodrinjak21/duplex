@@ -13,16 +13,27 @@ fn env_or(key: &str, default: &str) -> String {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_span_events(FmtSpan::CLOSE)
         .init();
-    let addr = env_or("WORKER_ADDR", "127.0.0.1:50051").parse().context("WORKER_ADDR is not a host:port")?;
-    let model = std::env::var("WHISPER_MODEL").map_err(|_| anyhow::anyhow!("WHISPER_MODEL is not set (path to ggml-small.bin)"))?;
+    let addr = env_or("WORKER_ADDR", "127.0.0.1:50051")
+        .parse()
+        .context("WORKER_ADDR is not a host:port")?;
+    let model = std::env::var("WHISPER_MODEL")
+        .map_err(|_| anyhow::anyhow!("WHISPER_MODEL is not set (path to ggml-small.bin)"))?;
     let stt = tokio::task::spawn_blocking(move || WhisperStt::load(&model)).await??;
-    let llm = OllamaLlm::new(env_or("OLLAMA_URL", "http://localhost:11434"), env_or("OLLAMA_MODEL", "qwen2.5:3b"));
+    let llm = OllamaLlm::new(
+        env_or("OLLAMA_URL", "http://localhost:11434"),
+        env_or("OLLAMA_MODEL", "qwen2.5:3b"),
+    );
 
     // Prewarm both models so the first turn does not pay load time.
-    let whisper_ok = match stt.transcribe(vec![0; 32_000], CancellationToken::new()).await {
+    let whisper_ok = match stt
+        .transcribe(vec![0; 32_000], CancellationToken::new())
+        .await
+    {
         Ok(_) => true,
         Err(e) => {
             tracing::error!("whisper prewarm failed: {e:#}");
@@ -39,7 +50,12 @@ async fn main() -> anyhow::Result<()> {
 
     let root = CancellationToken::new();
     let stop = CancellationToken::new();
-    let svc = Service::new(Arc::new(stt), Arc::new(llm), whisper_ok && ollama_ok, root.clone());
+    let svc = Service::new(
+        Arc::new(stt),
+        Arc::new(llm),
+        whisper_ok && ollama_ok,
+        root.clone(),
+    );
     let mut server = tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(VoiceServer::new(svc))
@@ -53,7 +69,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("SIGINT: stopping");
     stop.cancel();
     root.cancel();
-    if tokio::time::timeout(Duration::from_secs(2), server).await.is_err() {
+    if tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .is_err()
+    {
         tracing::warn!("sessions did not close within 2 s");
     }
     Ok(())

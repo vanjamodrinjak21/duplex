@@ -10,14 +10,14 @@ use std::{
 
 use async_trait::async_trait;
 use duplex_proto::{
-    client_msg, server_msg, voice_server::Voice, ClientMsg, Error, HealthReq, HealthResp, ServerMsg,
-    Token, TurnDone, Transcript,
+    client_msg, server_msg, voice_server::Voice, ClientMsg, Error, HealthReq, HealthResp,
+    ServerMsg, Token, Transcript, TurnDone,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
-use tracing::Instrument;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
+use tracing::Instrument;
 
 pub mod ollama;
 pub mod whisper;
@@ -25,14 +25,23 @@ pub mod whisper;
 /// `Ok(None)` means the transcription was aborted by `cancel`.
 #[async_trait]
 pub trait Stt: Send + Sync + 'static {
-    async fn transcribe(&self, pcm: Vec<u8>, cancel: CancellationToken) -> anyhow::Result<Option<(String, String)>>;
+    async fn transcribe(
+        &self,
+        pcm: Vec<u8>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Option<(String, String)>>;
 }
 
 /// Streams tokens into `tx`; must return promptly once `cancel` fires.
 /// `prompt` alternates user/assistant, oldest first, ending with the current user message.
 #[async_trait]
 pub trait Llm: Send + Sync + 'static {
-    async fn stream(&self, prompt: Vec<String>, tx: mpsc::Sender<String>, cancel: CancellationToken) -> anyhow::Result<()>;
+    async fn stream(
+        &self,
+        prompt: Vec<String>,
+        tx: mpsc::Sender<String>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct Service {
@@ -45,8 +54,19 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(stt: Arc<dyn Stt>, llm: Arc<dyn Llm>, model_loaded: bool, root: CancellationToken) -> Self {
-        Self { stt, llm, model_loaded, root, sessions: Arc::default() }
+    pub fn new(
+        stt: Arc<dyn Stt>,
+        llm: Arc<dyn Llm>,
+        model_loaded: bool,
+        root: CancellationToken,
+    ) -> Self {
+        Self {
+            stt,
+            llm,
+            model_loaded,
+            root,
+            sessions: Arc::default(),
+        }
     }
 }
 
@@ -67,6 +87,7 @@ struct Turn {
     spoken: Option<String>,
 }
 
+#[allow(clippy::result_large_err)] // tonic::Status is what the stream item carries
 fn msg(k: server_msg::Kind) -> Result<ServerMsg, Status> {
     Ok(ServerMsg { kind: Some(k) })
 }
@@ -128,7 +149,9 @@ impl Voice for Service {
                             }
                         }
                         if pcm.len() + a.pcm.len() > MAX_PCM_BYTES {
-                            let _ = tx.send(Err(Status::resource_exhausted("utterance too long"))).await;
+                            let _ = tx
+                                .send(Err(Status::resource_exhausted("utterance too long")))
+                                .await;
                             break;
                         }
                         pcm.extend_from_slice(&a.pcm);
@@ -141,16 +164,24 @@ impl Voice for Service {
                                 t.token.cancel();
                                 // The turn already sent its TurnDone; ack so the gateway can close its cancel span.
                                 if t.handle.is_finished() {
-                                    let _ = tx.send(msg(server_msg::Kind::Done(TurnDone {
-                                        turn_id: c.turn_id, cancelled: true, ..Default::default()
-                                    }))).await;
+                                    let _ = tx
+                                        .send(msg(server_msg::Kind::Done(TurnDone {
+                                            turn_id: c.turn_id,
+                                            cancelled: true,
+                                            ..Default::default()
+                                        })))
+                                        .await;
                                 }
                             }
                             // Ack comes from the turn task; ack here if no such turn is running.
                             _ => {
-                                let _ = tx.send(msg(server_msg::Kind::Done(TurnDone {
-                                    turn_id: c.turn_id, cancelled: true, ..Default::default()
-                                }))).await;
+                                let _ = tx
+                                    .send(msg(server_msg::Kind::Done(TurnDone {
+                                        turn_id: c.turn_id,
+                                        cancelled: true,
+                                        ..Default::default()
+                                    })))
+                                    .await;
                             }
                         }
                     }
@@ -161,8 +192,21 @@ impl Voice for Service {
                         }
                         let token = session.child_token();
                         let audio = std::mem::take(&mut pcm);
-                        let handle = tokio::spawn(run_turn(e.turn_id, audio, history.clone(), stt.clone(), llm.clone(), tx.clone(), token.clone()));
-                        current = Some(Turn { id: e.turn_id, token, handle, spoken: None });
+                        let handle = tokio::spawn(run_turn(
+                            e.turn_id,
+                            audio,
+                            history.clone(),
+                            stt.clone(),
+                            llm.clone(),
+                            tx.clone(),
+                            token.clone(),
+                        ));
+                        current = Some(Turn {
+                            id: e.turn_id,
+                            token,
+                            handle,
+                            spoken: None,
+                        });
                     }
                     _ => {}
                 }
@@ -184,14 +228,27 @@ async fn run_turn(
 ) -> TurnResult {
     let t0 = Instant::now();
     let done = |cancelled, stt_ms, ttft_ms| {
-        msg(server_msg::Kind::Done(TurnDone { turn_id, stt_ms, ttft_ms, cancelled }))
+        msg(server_msg::Kind::Done(TurnDone {
+            turn_id,
+            stt_ms,
+            ttft_ms,
+            cancelled,
+        }))
     };
     let error = |code: &str, e: anyhow::Error| {
         tracing::warn!(turn_id, code, "{e:#}");
-        msg(server_msg::Kind::Error(Error { turn_id, code: code.into(), message: format!("{e:#}") }))
+        msg(server_msg::Kind::Error(Error {
+            turn_id,
+            code: code.into(),
+            message: format!("{e:#}"),
+        }))
     };
     let stt_span = tracing::info_span!("stt", turn_id);
-    let (text, lang) = match stt.transcribe(audio, cancel.clone()).instrument(stt_span.clone()).await {
+    let (text, lang) = match stt
+        .transcribe(audio, cancel.clone())
+        .instrument(stt_span.clone())
+        .await
+    {
         Ok(Some(r)) => r,
         Ok(None) => {
             let _ = tx.send(done(true, 0, 0)).await;
@@ -208,7 +265,14 @@ async fn run_turn(
         let _ = tx.send(done(true, stt_ms, 0)).await;
         return None;
     }
-    let _ = tx.send(msg(server_msg::Kind::Transcript(Transcript { turn_id, text: text.clone(), lang }))).instrument(stt_span).await;
+    let _ = tx
+        .send(msg(server_msg::Kind::Transcript(Transcript {
+            turn_id,
+            text: text.clone(),
+            lang,
+        })))
+        .instrument(stt_span)
+        .await;
     history.push(text.clone());
     let (ttx, mut trx) = mpsc::channel::<String>(256);
     let t1 = Instant::now();
@@ -235,8 +299,14 @@ async fn run_turn(
     }
     let failed = match gen.await {
         Ok(Ok(())) => false,
-        Ok(Err(e)) => { let _ = tx.send(error("llm", e)).await; true }
-        Err(e) => { let _ = tx.send(error("llm", e.into())).await; true }
+        Ok(Err(e)) => {
+            let _ = tx.send(error("llm", e)).await;
+            true
+        }
+        Err(e) => {
+            let _ = tx.send(error("llm", e.into())).await;
+            true
+        }
     };
     let _ = tx.send(done(cancel.is_cancelled(), stt_ms, ttft_ms)).await;
     (!failed).then_some((text, reply))
@@ -245,7 +315,9 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use duplex_proto::{voice_client::VoiceClient, voice_server::VoiceServer, AudioChunk, Cancel, EndOfUtterance};
+    use duplex_proto::{
+        voice_client::VoiceClient, voice_server::VoiceServer, AudioChunk, Cancel, EndOfUtterance,
+    };
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -253,7 +325,11 @@ mod tests {
     struct MockStt;
     #[async_trait]
     impl Stt for MockStt {
-        async fn transcribe(&self, _: Vec<u8>, _: CancellationToken) -> anyhow::Result<Option<(String, String)>> {
+        async fn transcribe(
+            &self,
+            _: Vec<u8>,
+            _: CancellationToken,
+        ) -> anyhow::Result<Option<(String, String)>> {
             Ok(Some(("hello".into(), "en".into())))
         }
     }
@@ -267,12 +343,22 @@ mod tests {
     }
     impl MockLlm {
         fn new(n: usize, every_ms: u64) -> Arc<Self> {
-            Arc::new(Self { n, every: Duration::from_millis(every_ms), fail: 0.into(), prompts: Mutex::default() })
+            Arc::new(Self {
+                n,
+                every: Duration::from_millis(every_ms),
+                fail: 0.into(),
+                prompts: Mutex::default(),
+            })
         }
     }
     #[async_trait]
     impl Llm for MockLlm {
-        async fn stream(&self, prompt: Vec<String>, tx: mpsc::Sender<String>, cancel: CancellationToken) -> anyhow::Result<()> {
+        async fn stream(
+            &self,
+            prompt: Vec<String>,
+            tx: mpsc::Sender<String>,
+            cancel: CancellationToken,
+        ) -> anyhow::Result<()> {
             self.prompts.lock().unwrap().push(prompt);
             if self.fail.load(Ordering::Relaxed) > 0 {
                 self.fail.fetch_sub(1, Ordering::Relaxed);
@@ -284,7 +370,9 @@ mod tests {
                     _ = cancel.cancelled() => return Ok(()),
                     _ = tokio::time::sleep(self.every) => {}
                 }
-                if tx.send(format!("t{i}")).await.is_err() { return Ok(()); }
+                if tx.send(format!("t{i}")).await.is_err() {
+                    return Ok(());
+                }
             }
             Ok(())
         }
@@ -294,10 +382,14 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
         let svc = Service::new(Arc::new(MockStt), llm, true, CancellationToken::new());
-        tokio::spawn(tonic::transport::Server::builder()
-            .add_service(VoiceServer::new(svc))
-            .serve_with_incoming(TcpListenerStream::new(l)));
-        VoiceClient::connect(format!("http://{addr}")).await.unwrap()
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(VoiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(l)),
+        );
+        VoiceClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap()
     }
 
     async fn start() -> VoiceClient<tonic::transport::Channel> {
@@ -308,7 +400,11 @@ mod tests {
 
     async fn open(c: &mut VoiceClient<tonic::transport::Channel>) -> Conv {
         let (tx, rx) = mpsc::channel(8);
-        let out = c.converse(ReceiverStream::new(rx)).await.unwrap().into_inner();
+        let out = c
+            .converse(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
         (tx, out)
     }
 
@@ -317,8 +413,16 @@ mod tests {
     }
 
     async fn utter(tx: &mpsc::Sender<ClientMsg>, turn_id: u64) {
-        tx.send(send(client_msg::Kind::Audio(AudioChunk { turn_id, seq: 0, pcm: vec![0; 640] }))).await.unwrap();
-        tx.send(send(client_msg::Kind::Eou(EndOfUtterance { turn_id }))).await.unwrap();
+        tx.send(send(client_msg::Kind::Audio(AudioChunk {
+            turn_id,
+            seq: 0,
+            pcm: vec![0; 640],
+        })))
+        .await
+        .unwrap();
+        tx.send(send(client_msg::Kind::Eou(EndOfUtterance { turn_id })))
+            .await
+            .unwrap();
     }
 
     /// Reads until TurnDone for `turn_id`, returning every message kind seen.
@@ -328,7 +432,9 @@ mod tests {
             let k = out.next().await.unwrap().unwrap().kind.unwrap();
             let end = matches!(&k, server_msg::Kind::Done(d) if d.turn_id == turn_id);
             seen.push(k);
-            if end { return seen; }
+            if end {
+                return seen;
+            }
         }
     }
 
@@ -339,7 +445,14 @@ mod tests {
         assert!(h.model_loaded);
         assert_eq!(h.active_sessions, 0);
         let _conv = open(&mut c).await;
-        assert_eq!(c.health(HealthReq {}).await.unwrap().into_inner().active_sessions, 1);
+        assert_eq!(
+            c.health(HealthReq {})
+                .await
+                .unwrap()
+                .into_inner()
+                .active_sessions,
+            1
+        );
     }
 
     #[tokio::test]
@@ -349,14 +462,27 @@ mod tests {
         utter(&tx, 1).await;
         // wait for the first token, then cancel
         loop {
-            if let Some(server_msg::Kind::Token(_)) = out.next().await.unwrap().unwrap().kind { break; }
+            if let Some(server_msg::Kind::Token(_)) = out.next().await.unwrap().unwrap().kind {
+                break;
+            }
         }
-        tx.send(send(client_msg::Kind::Cancel(Cancel { turn_id: 1, reason: 0, spoken_text: "t0".into() }))).await.unwrap();
+        tx.send(send(client_msg::Kind::Cancel(Cancel {
+            turn_id: 1,
+            reason: 0,
+            spoken_text: "t0".into(),
+        })))
+        .await
+        .unwrap();
         let mut tokens_after_ack = 0;
         let mut acked = false;
-        while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_millis(300), out.next()).await {
+        while let Ok(Some(Ok(m))) =
+            tokio::time::timeout(Duration::from_millis(300), out.next()).await
+        {
             match m.kind {
-                Some(server_msg::Kind::Done(d)) => { assert!(d.cancelled); acked = true; }
+                Some(server_msg::Kind::Done(d)) => {
+                    assert!(d.cancelled);
+                    acked = true;
+                }
                 Some(server_msg::Kind::Token(_)) if acked => tokens_after_ack += 1,
                 _ => {}
             }
@@ -372,9 +498,17 @@ mod tests {
         let (tx, mut out) = open(&mut c).await;
         utter(&tx, 1).await;
         loop {
-            if let Some(server_msg::Kind::Token(_)) = out.next().await.unwrap().unwrap().kind { break; }
+            if let Some(server_msg::Kind::Token(_)) = out.next().await.unwrap().unwrap().kind {
+                break;
+            }
         }
-        tx.send(send(client_msg::Kind::Cancel(Cancel { turn_id: 1, reason: 0, spoken_text: "t0".into() }))).await.unwrap();
+        tx.send(send(client_msg::Kind::Cancel(Cancel {
+            turn_id: 1,
+            reason: 0,
+            spoken_text: "t0".into(),
+        })))
+        .await
+        .unwrap();
         until_done(&mut out, 1).await;
         utter(&tx, 2).await;
         until_done(&mut out, 2).await;
@@ -405,11 +539,17 @@ mod tests {
         utter(&tx, 1).await;
         let seen = until_done(&mut out, 1).await;
         let n = seen.len();
-        assert!(matches!(&seen[n - 2], server_msg::Kind::Error(e) if e.turn_id == 1 && e.code == "llm"), "{seen:?}");
+        assert!(
+            matches!(&seen[n - 2], server_msg::Kind::Error(e) if e.turn_id == 1 && e.code == "llm"),
+            "{seen:?}"
+        );
         assert!(matches!(&seen[n - 1], server_msg::Kind::Done(d) if !d.cancelled));
         utter(&tx, 2).await;
         let seen = until_done(&mut out, 2).await;
-        assert!(seen.iter().any(|k| matches!(k, server_msg::Kind::Token(_))), "{seen:?}");
+        assert!(
+            seen.iter().any(|k| matches!(k, server_msg::Kind::Token(_))),
+            "{seen:?}"
+        );
         assert!(!seen.iter().any(|k| matches!(k, server_msg::Kind::Error(_))));
     }
 }

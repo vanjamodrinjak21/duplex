@@ -19,14 +19,27 @@ pub struct OllamaLlm {
 
 impl OllamaLlm {
     pub fn new(url: String, model: String) -> Self {
-        Self { url, model, client: reqwest::Client::new() }
+        Self {
+            url,
+            model,
+            client: reqwest::Client::new(),
+        }
     }
 
     /// Loads the model into memory before the first turn.
     pub async fn prewarm(&self) -> anyhow::Result<()> {
         let body = json!({ "model": self.model, "keep_alive": KEEP_ALIVE });
-        let r = self.client.post(format!("{}/api/generate", self.url)).body(body.to_string()).send().await?;
-        anyhow::ensure!(r.status().is_success(), "ollama prewarm: HTTP {}", r.status());
+        let r = self
+            .client
+            .post(format!("{}/api/generate", self.url))
+            .body(body.to_string())
+            .send()
+            .await?;
+        anyhow::ensure!(
+            r.status().is_success(),
+            "ollama prewarm: HTTP {}",
+            r.status()
+        );
         Ok(())
     }
 }
@@ -36,15 +49,26 @@ pub fn messages(prompt: &[String]) -> Vec<Value> {
     prompt
         .iter()
         .enumerate()
-        .map(|(i, c)| json!({ "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": c }))
+        .map(
+            |(i, c)| json!({ "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": c }),
+        )
         .collect()
 }
 
 #[async_trait]
 impl Llm for OllamaLlm {
-    async fn stream(&self, prompt: Vec<String>, tx: mpsc::Sender<String>, cancel: CancellationToken) -> anyhow::Result<()> {
+    async fn stream(
+        &self,
+        prompt: Vec<String>,
+        tx: mpsc::Sender<String>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
         let body = json!({ "model": self.model, "stream": true, "keep_alive": KEEP_ALIVE, "messages": messages(&prompt) });
-        let req = self.client.post(format!("{}/api/chat", self.url)).header("content-type", "application/json").body(body.to_string());
+        let req = self
+            .client
+            .post(format!("{}/api/chat", self.url))
+            .header("content-type", "application/json")
+            .body(body.to_string());
         let resp = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(()),
@@ -94,7 +118,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Serves one request: returns its body via the handle and writes `lines`, then (if `forever`) more lines until the client hangs up.
-    async fn fake(lines: Vec<&'static str>, forever: bool) -> (String, tokio::task::JoinHandle<String>) {
+    async fn fake(
+        lines: Vec<&'static str>,
+        forever: bool,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         let h = tokio::spawn(async move {
@@ -106,7 +133,12 @@ mod tests {
                 req.extend_from_slice(&b[..n]);
                 let text = String::from_utf8_lossy(&req).to_string();
                 if let Some(i) = text.find("\r\n\r\n") {
-                    let len: usize = text.to_lowercase().split("content-length: ").nth(1).and_then(|r| r.split("\r\n").next()?.parse().ok()).unwrap_or(0);
+                    let len: usize = text
+                        .to_lowercase()
+                        .split("content-length: ")
+                        .nth(1)
+                        .and_then(|r| r.split("\r\n").next()?.parse().ok())
+                        .unwrap_or(0);
                     if req.len() >= i + 4 + len {
                         break;
                     }
@@ -118,11 +150,14 @@ mod tests {
             for l in lines {
                 let _ = s.write_all(format!("{l}\n").as_bytes()).await;
             }
-            while forever {
-                if s.write_all(b"{\"message\":{\"content\":\"x\"},\"done\":false}\n").await.is_err() {
-                    break;
+            if forever {
+                while s
+                    .write_all(b"{\"message\":{\"content\":\"x\"},\"done\":false}\n")
+                    .await
+                    .is_ok()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
             body
         });
@@ -142,12 +177,30 @@ mod tests {
         .await;
         let llm = OllamaLlm::new(url, "qwen2.5:3b".into());
         let (tx, mut rx) = mpsc::channel(8);
-        llm.stream(vec!["a".into(), "b".into(), "c".into()], tx, CancellationToken::new()).await.unwrap();
-        assert_eq!((rx.recv().await.as_deref(), rx.recv().await.as_deref(), rx.recv().await), (Some("Hi"), Some(" there"), None));
+        llm.stream(
+            vec!["a".into(), "b".into(), "c".into()],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                rx.recv().await.as_deref(),
+                rx.recv().await.as_deref(),
+                rx.recv().await
+            ),
+            (Some("Hi"), Some(" there"), None)
+        );
         let body: Value = serde_json::from_str(&h.await.unwrap()).unwrap();
         assert_eq!(body["stream"], true);
         assert_eq!(body["keep_alive"], KEEP_ALIVE);
-        let roles: Vec<_> = body["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        let roles: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
         assert_eq!(roles, ["user", "assistant", "user"]);
     }
 
@@ -164,7 +217,11 @@ mod tests {
         rx.recv().await.unwrap();
         let t = Instant::now();
         cancel.cancel();
-        tokio::time::timeout(Duration::from_millis(100), task).await.expect("stream() did not return within 100 ms").unwrap().unwrap();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("stream() did not return within 100 ms")
+            .unwrap()
+            .unwrap();
         assert!(t.elapsed() < Duration::from_millis(100));
     }
 
@@ -179,6 +236,9 @@ mod tests {
             let _ = s.write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
         });
         let (tx, _rx) = mpsc::channel(8);
-        assert!(OllamaLlm::new(url, "m".into()).stream(vec!["hi".into()], tx, CancellationToken::new()).await.is_err());
+        assert!(OllamaLlm::new(url, "m".into())
+            .stream(vec!["hi".into()], tx, CancellationToken::new())
+            .await
+            .is_err());
     }
 }
