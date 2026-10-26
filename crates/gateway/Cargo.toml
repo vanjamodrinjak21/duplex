@@ -1,0 +1,9 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+duplex-proto = { path = "../../proto" }
+tokio.workspace = true
+tonic.workspace = true

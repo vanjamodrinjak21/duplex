@@ -1,0 +1,15 @@
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+duplex-proto = { path = "../../proto" }
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"

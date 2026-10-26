@@ -1,0 +1,40 @@
+syntax = "proto3";
+package duplex.v1;
+
+service Voice {
+  rpc Converse(stream ClientMsg) returns (stream ServerMsg);
+  rpc Health(HealthReq) returns (HealthResp);
+}
+
+message ClientMsg {
+  oneof kind {
+    SessionStart start = 1;
+    AudioChunk audio = 2;
+    EndOfUtterance eou = 3;
+    Cancel cancel = 4;
+  }
+}
+
+message SessionStart { string language = 1; string voice = 2; string model = 3; }
+message AudioChunk { uint64 turn_id = 1; uint64 seq = 2; bytes pcm = 3; }
+message EndOfUtterance { uint64 turn_id = 1; }
+// spoken_text: what the gateway actually played, so the worker stores a truncated reply.
+message Cancel { uint64 turn_id = 1; CancelReason reason = 2; string spoken_text = 3; }
+enum CancelReason { BARGE_IN = 0; CLIENT_CLOSED = 1; TIMEOUT = 2; }
+
+message ServerMsg {
+  oneof kind {
+    Transcript transcript = 1;
+    Token token = 2;
+    TurnDone done = 3;
+    Error error = 4;
+  }
+}
+
+message Transcript { uint64 turn_id = 1; string text = 2; string lang = 3; }
+message Token { uint64 turn_id = 1; string text = 2; }
+message TurnDone { uint64 turn_id = 1; uint32 stt_ms = 2; uint32 ttft_ms = 3; bool cancelled = 4; }
+message Error { uint64 turn_id = 1; string code = 2; string message = 3; }
+
+message HealthReq {}
+message HealthResp { bool model_loaded = 1; uint32 queue_depth = 2; uint32 active_sessions = 3; }
