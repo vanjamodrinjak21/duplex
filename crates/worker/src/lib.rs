@@ -291,7 +291,13 @@ async fn run_turn(
                 Some(text) => {
                     if ttft_span.take().is_some() { ttft_ms = t1.elapsed().as_millis() as u32; }
                     reply.push_str(&text);
-                    if tx.send(msg(server_msg::Kind::Token(Token { turn_id, text }))).await.is_err() { break; }
+                    // Cancel first, so a full outbound channel cannot delay it.
+                    let sent = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        r = tx.send(msg(server_msg::Kind::Token(Token { turn_id, text }))) => r,
+                    };
+                    if sent.is_err() { break; }
                 }
                 None => break,
             }
