@@ -20,12 +20,8 @@ const POLL: Duration = Duration::from_millis(2);
 /// A few voices named in the invalid-voice error.
 const VOICE_HINT: &str = "af_heart, af_bella, am_adam, bf_emma";
 
-/// Warmup sentences, short to long.
-pub const WARMUP: [&str; 3] = [
-    "Hello.",
-    "Sure, I can help you with that right now.",
-    "Well, that depends on a few things, so let me walk you through the main options first, and then we can decide together which one fits best.",
-];
+/// Warmup sentences (short, medium); a third, long stage added ~1.7 s (Metal) for no measured gain.
+pub const WARMUP: [&str; 2] = ["Hello.", "Sure, I can help you with that right now."];
 
 /// Blocking, CPU-bound text-to-speech engine.
 pub trait Synth: Send + Sync + 'static {
@@ -86,6 +82,24 @@ pub enum AnyTtsDevice {
     Cpu,
 }
 
+impl AnyTtsDevice {
+    /// The spelling `ANYTTS_DEVICE` uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metal => "metal",
+            Self::Cpu => "cpu",
+        }
+    }
+}
+
+/// Checks `KOKORO_VOICE` is a plain voice name (it becomes a file name for any-tts).
+pub fn parse_voice(v: &str) -> anyhow::Result<&str> {
+    if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!("KOKORO_VOICE={v} must be letters, digits and underscores only (e.g. {VOICE_HINT})");
+    }
+    Ok(v)
+}
+
 /// Parses `ANYTTS_DEVICE`; unset means Metal.
 pub fn parse_anytts_device(v: Option<&str>) -> anyhow::Result<AnyTtsDevice> {
     match v {
@@ -132,8 +146,11 @@ impl AnyTtsSynth {
         let config = any_tts::TtsConfig::new(any_tts::ModelType::Kokoro)
             .with_model_path(model_dir)
             .with_device(device);
-        let model = any_tts::load_model(config)
-            .with_context(|| format!("load Kokoro weights from {model_dir}"))?;
+        let model = any_tts::load_model(config).with_context(|| {
+            format!(
+                "load Kokoro weights from {model_dir} (see AGENTS.md for the download commands)"
+            )
+        })?;
         Ok(Self {
             model,
             voice: voice.into(),
@@ -308,7 +325,7 @@ impl<Y: Synth> KokoroSpeaker<Y> {
         Ok((speaker, stream))
     }
 
-    /// Synthesizes `WARMUP` sentences (short, medium, long) so kernels and shape-dependent buffers are warm
+    /// Synthesizes the `WARMUP` sentences so kernels and shape-dependent buffers are warm
     /// before the first real one; logs each stage and the total.
     pub async fn prewarm(&self) -> anyhow::Result<()> {
         let total = Instant::now();
@@ -698,6 +715,12 @@ mod tests {
         assert_eq!(parse_anytts_device(Some("cpu")).unwrap(), AnyTtsDevice::Cpu);
         let e = parse_anytts_device(Some("gpu")).unwrap_err().to_string();
         assert!(e.contains("ANYTTS_DEVICE"), "{e}");
+        assert_eq!(AnyTtsDevice::Cpu.as_str(), "cpu");
+        assert_eq!(parse_voice("af_heart").unwrap(), "af_heart");
+        for bad in ["", "../x", "a b", "a.pt"] {
+            let e = parse_voice(bad).unwrap_err().to_string();
+            assert!(e.contains("KOKORO_VOICE"), "{e}");
+        }
         assert_eq!(parse_anytts_gain(None).unwrap(), 1.44);
         assert_eq!(parse_anytts_gain(Some("2")).unwrap(), 2.0);
         for bad in ["0", "-1", "nan", "abc"] {
@@ -788,7 +811,7 @@ mod tests {
         assert!(secs >= 1.0 && peak > 0.05, "secs={secs} peak={peak}");
     }
 
-    /// First-sentence latency after `ANYTTS_WARMUP_STAGES` (1 = old "Hello." only, 3 = all, default 3) warmup sentences.
+    /// First-sentence latency after `ANYTTS_WARMUP_STAGES` (1 = "Hello." only, 2 = all, default 2) warmup sentences.
     #[cfg(feature = "anytts")]
     #[test]
     #[ignore]
@@ -796,7 +819,7 @@ mod tests {
         let model = std::env::var("ANYTTS_MODEL").expect("set ANYTTS_MODEL to the Kokoro-82M dir");
         let device = parse_anytts_device(std::env::var("ANYTTS_DEVICE").ok().as_deref()).unwrap();
         let stages: usize = std::env::var("ANYTTS_WARMUP_STAGES")
-            .map_or(3, |v| v.parse().expect("ANYTTS_WARMUP_STAGES"));
+            .map_or(2, |v| v.parse().expect("ANYTTS_WARMUP_STAGES"));
         let t = Instant::now();
         let synth = AnyTtsSynth::new(&model, device, "af_heart", 1.0, 1.44).unwrap();
         println!("load {:?}", t.elapsed());

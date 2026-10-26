@@ -5,7 +5,7 @@ use anyhow::Context;
 use gateway::audio::{start_mic, FakeMic};
 use gateway::session::{run, SaySpeaker};
 #[cfg(feature = "anytts")]
-use gateway::tts::{parse_anytts_device, parse_anytts_gain, AnyTtsSynth};
+use gateway::tts::{parse_anytts_device, parse_anytts_gain, parse_voice, AnyTtsSynth};
 use gateway::tts::{parse_tts, AnySpeaker, KokoroSpeaker, KokoroSynth, Tts};
 use gateway::{DropOldest, DEFAULT_VAD_THRESHOLD};
 use tokio_util::sync::CancellationToken;
@@ -17,7 +17,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,ort=warn,any_tts=error")),
         )
         .init();
     let addr = std::env::var("WORKER_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".into());
@@ -132,9 +133,15 @@ async fn anytts_speaker(
     let model = std::env::var("ANYTTS_MODEL").unwrap_or_else(|_| "models/Kokoro-82M".into());
     let device = parse_anytts_device(std::env::var("ANYTTS_DEVICE").ok().as_deref())?;
     let gain = parse_anytts_gain(std::env::var("ANYTTS_GAIN").ok().as_deref())?;
+    let voice = parse_voice(voice)?;
     anyhow::ensure!(
         std::path::Path::new(&model).is_dir(),
         "TTS=anytts but ANYTTS_MODEL={model} is not a directory (see AGENTS.md for the download commands)"
+    );
+    tracing::info!(
+        model,
+        device = device.as_str(),
+        "loading Kokoro-82M (anytts)"
     );
     let t = std::time::Instant::now();
     let v = voice.to_string();
@@ -143,7 +150,14 @@ async fn anytts_speaker(
             .await??;
     tracing::info!(ms = t.elapsed().as_millis() as u64, "anytts load");
     let (speaker, stream) = KokoroSpeaker::start(synth)?;
+    tracing::info!("warming up (Metal kernels, buffers); the gateway is not ready yet");
     speaker.prewarm().await?;
-    tracing::info!(?device, voice, speed, gain, "tts=anytts");
+    tracing::info!(
+        device = device.as_str(),
+        voice,
+        speed,
+        gain = format_args!("{gain:.2}"),
+        "tts=anytts"
+    );
     Ok((AnySpeaker::AnyTts(speaker), Some(stream)))
 }

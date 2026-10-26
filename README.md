@@ -20,7 +20,8 @@ See `AGENTS.md` for all environment variables. An optional candle-based Kokoro b
 |---|---|
 | TTFA (end of speech to first audio (speaker started)) | to be measured |
 | Barge-in (speech detected to playback stopped) | to be measured |
-| Audio callback allocations (input and output, 2000 callbacks each, incl. underrun, overflow and kill) | 0 (counting-allocator unit tests) |
+
+The audio callbacks (mic input and speaker output) make 0 heap allocations over 2000 calls each, including underrun, ring overflow and kill; this is checked by counting-allocator unit tests, not by live measurement.
 
 ## Measuring
 

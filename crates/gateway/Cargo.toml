@@ -7,7 +7,7 @@ edition = "2021"
 # Opt-in candle Kokoro (any-tts), Metal or Accelerate CPU. Its `kokoro` feature pulls lindera with
 # `embed-ipadic`, whose build.rs downloads a Japanese dictionary from lindera.dev at BUILD time
 # (no runtime network) and cannot be switched off (any-tts hardcodes it). DOCS_RS=1 skips it but also
-# makes ort-sys skip linking, so it only works for check/clippy. Set LINDERA_CACHE=<dir> to download once.
+# makes ort-sys skip linking, so it only works for check/clippy. Set LINDERA_DICTIONARIES_PATH=<dir> to download once.
 anytts = ["dep:any-tts"]
 
 [dependencies]
