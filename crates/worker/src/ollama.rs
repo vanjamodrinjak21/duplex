@@ -46,14 +46,15 @@ impl OllamaLlm {
     }
 }
 
-/// Oldest first, alternating user/assistant; the last entry is the current user message.
+/// System prompt so replies read well when spoken aloud.
+pub const SPOKEN_STYLE: &str = "You are a voice assistant; your reply is spoken aloud. Answer in short, conversational sentences. Use contractions and plain spoken words. No lists, no markdown, no emojis. No URLs or code unless asked. Keep answers brief.";
+
+/// A system message, then oldest first alternating user/assistant; the last entry is the current user message.
 pub fn messages(prompt: &[String]) -> Vec<Value> {
-    prompt
-        .iter()
-        .enumerate()
-        .map(
+    std::iter::once(json!({ "role": "system", "content": SPOKEN_STYLE }))
+        .chain(prompt.iter().enumerate().map(
             |(i, c)| json!({ "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": c }),
-        )
+        ))
         .collect()
 }
 
@@ -122,6 +123,26 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn messages_start_with_the_spoken_style_system_message() {
+        let roles = |p: &[&str]| -> Vec<String> {
+            let p: Vec<String> = p.iter().map(|s| s.to_string()).collect();
+            messages(&p)
+                .iter()
+                .map(|m| m["role"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let m = messages(&["hi".into()]);
+        assert_eq!(m[0]["role"], "system");
+        assert!(m[0]["content"].as_str().unwrap().contains(SPOKEN_STYLE));
+        assert_eq!(m[1]["content"], "hi");
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            roles(&["a", "b", "c"]),
+            ["system", "user", "assistant", "user"]
+        );
+    }
 
     /// Serves one request: returns its body via the handle and writes `lines`, then (if `forever`) more lines until the client hangs up.
     async fn fake(
