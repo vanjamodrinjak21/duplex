@@ -12,7 +12,7 @@ cargo run --release -p gateway                                # live mic, headph
 FAKE_MIC=fixtures/en.wav cargo run --release -p gateway       # headless, WAV as the mic
 ```
 
-See `AGENTS.md` for all environment variables.
+See `AGENTS.md` for all environment variables. An optional candle-based Kokoro backend (`TTS=anytts`, `--features anytts`) is described there too.
 
 ## Results
 
@@ -20,6 +20,8 @@ See `AGENTS.md` for all environment variables.
 |---|---|
 | TTFA (end of speech to first audio (speaker started)) | to be measured |
 | Barge-in (speech detected to playback stopped) | to be measured |
+
+The audio callbacks (mic input and speaker output) make 0 heap allocations over 2000 calls each, including underrun, ring overflow and kill; this is checked by counting-allocator unit tests, not by live measurement.
 
 ## Measuring
 
@@ -43,5 +45,5 @@ Paste the medians into the Results table above.
 
 - Headphones required: there is no echo cancellation, so speaker output would trigger barge-in.
 - With `TTS=say`, `say` starts per sentence as a new process, which adds its own startup latency to TTFA.
-- If Kokoro fails on one sentence, that sentence is skipped with a warning on stderr (a silent gap).
+- If the TTS engine fails on one sentence, that sentence is skipped with a warning on stderr (a silent gap).
 - Ollama serialises requests by default, so concurrent sessions queue behind each other.

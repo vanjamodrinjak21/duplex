@@ -3,6 +3,41 @@ pub mod audio;
 pub mod session;
 pub mod tts;
 
+/// Test-only counting allocator: per-thread allocation counts, so parallel tests do not interfere.
+#[cfg(test)]
+pub(crate) mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local!(static COUNT: Cell<u64> = const { Cell::new(0) });
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+            System.alloc(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            System.dealloc(p, l)
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
+            System.realloc(p, l, n)
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    /// Heap allocations (alloc + realloc) made by `f` on this thread.
+    pub(crate) fn count(f: impl FnOnce()) -> u64 {
+        let before = COUNT.with(Cell::get);
+        f();
+        COUNT.with(Cell::get) - before
+    }
+}
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
