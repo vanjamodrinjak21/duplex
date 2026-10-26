@@ -125,6 +125,7 @@ pub fn parse_anytts_gain(v: Option<&str>) -> anyhow::Result<f32> {
 pub struct AnyTtsSynth {
     model: Box<dyn any_tts::traits::TtsModel>,
     voice: String,
+    voices_dir: String,
     speed: f64,
     gain: f32,
 }
@@ -154,6 +155,7 @@ impl AnyTtsSynth {
         Ok(Self {
             model,
             voice: voice.into(),
+            voices_dir: format!("{model_dir}/voices"),
             speed: speed.into(),
             gain,
         })
@@ -182,8 +184,9 @@ impl Synth for AnyTtsSynth {
             }
             Err(any_tts::TtsError::UnknownVoice(v)) => {
                 bail!(
-                    "KOKORO_VOICE={} is not in ANYTTS_MODEL/voices ({v})",
-                    self.voice
+                    "KOKORO_VOICE={} is not in {} ({v})",
+                    self.voice,
+                    self.voices_dir
                 )
             }
             Err(e) => Err(e.into()),

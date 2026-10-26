@@ -150,7 +150,7 @@ async fn anytts_speaker(
             .await??;
     tracing::info!(ms = t.elapsed().as_millis() as u64, "anytts load");
     let (speaker, stream) = KokoroSpeaker::start(synth)?;
-    tracing::info!("warming up (Metal kernels, buffers); the gateway is not ready yet");
+    tracing::info!("warming up the model; the gateway is not ready yet");
     speaker.prewarm().await?;
     tracing::info!(
         device = device.as_str(),
