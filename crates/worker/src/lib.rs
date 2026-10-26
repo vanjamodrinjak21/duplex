@@ -27,6 +27,10 @@ pub struct Service {
     pub llm: Arc<dyn Llm>,
 }
 
+/// ~60 s of 16 kHz mono i16; a longer utterance closes the stream.
+const MAX_PCM_BYTES: usize = 16_000 * 2 * 60;
+const MAX_HISTORY: usize = 6;
+
 type Out = Pin<Box<dyn Stream<Item = Result<ServerMsg, Status>> + Send>>;
 
 fn msg(k: server_msg::Kind) -> Result<ServerMsg, Status> {
@@ -61,6 +65,10 @@ impl Voice for Service {
                                 pcm.clear();
                             }
                         }
+                        if pcm.len() + a.pcm.len() > MAX_PCM_BYTES {
+                            let _ = tx.send(Err(Status::resource_exhausted("utterance too long"))).await;
+                            break;
+                        }
                         pcm.extend_from_slice(&a.pcm);
                     }
                     Some(client_msg::Kind::Cancel(c)) => {
@@ -78,12 +86,14 @@ impl Voice for Service {
                         }
                     }
                     Some(client_msg::Kind::Eou(e)) => {
+                        if let Some((_, old)) = current.take() { old.cancel(); }
                         let token = session.child_token();
                         current = Some((e.turn_id, token.clone()));
                         let (stt, llm, tx) = (stt.clone(), llm.clone(), tx.clone());
                         let audio = std::mem::take(&mut pcm);
                         let hist = history.clone();
                         history.push(String::new());
+                        if history.len() > MAX_HISTORY { history.remove(0); }
                         tokio::spawn(run_turn(e.turn_id, audio, hist, stt, llm, tx, token));
                     }
                     _ => {}
