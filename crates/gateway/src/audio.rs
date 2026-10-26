@@ -143,6 +143,17 @@ impl Framer {
     }
 }
 
+/// Input callback body. REAL-TIME: copies into the preallocated ring and bumps a counter, nothing else.
+fn mic_callback(prod: &mut rtrb::Producer<f32>, dropped: &AtomicU64, data: &[f32]) {
+    let n = data.len().min(prod.slots());
+    if let Ok(chunk) = prod.write_chunk_uninit(n) {
+        chunk.fill_from_iter(data[..n].iter().copied());
+    }
+    if n < data.len() {
+        dropped.fetch_add((data.len() - n) as u64, Ordering::Relaxed);
+    }
+}
+
 /// Starts the default input device. Keep the returned stream alive; `ring_dropped` counts samples lost to a full ring.
 pub fn start_mic(
     q: Arc<DropOldest<Frame>>,
@@ -169,13 +180,7 @@ pub fn start_mic(
             config,
             // Real-time thread: only copy into the preallocated ring and bump a counter.
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let n = data.len().min(prod.slots());
-                if let Ok(chunk) = prod.write_chunk_uninit(n) {
-                    chunk.fill_from_iter(data[..n].iter().copied());
-                }
-                if n < data.len() {
-                    dropped.fetch_add((data.len() - n) as u64, Ordering::Relaxed);
-                }
+                mic_callback(&mut prod, &dropped, data)
             },
             |e| tracing::warn!("mic: {e}"),
             None,
@@ -236,5 +241,53 @@ mod tests {
         assert!(n > 50);
         m.i = n;
         assert_eq!(m.next().await, Some(vec![0; FRAME]));
+    }
+
+    #[test]
+    fn mic_callback_makes_zero_heap_allocations() {
+        let (mut prod, mut cons) = rtrb::RingBuffer::<f32>::new(4_800);
+        let dropped = AtomicU64::new(0);
+        let data = [0.2f32; 960]; // 10 ms of 48 kHz stereo
+        let n = crate::alloc_count::count(|| {
+            for i in 0..2_000 {
+                mic_callback(&mut prod, &dropped, &data);
+                if i % 7 == 0 {
+                    // Consumer lags: the ring fills and the drop path runs.
+                    let k = cons.slots().min(960);
+                    if let Ok(c) = cons.read_chunk(k) {
+                        c.commit_all();
+                    }
+                }
+            }
+        });
+        assert_eq!(n, 0, "mic callback allocated");
+        assert!(dropped.load(Ordering::Relaxed) > 0);
+    }
+
+    /// Informational: allocations per 20 ms frame on the capture-to-sender path (Framer + queue push).
+    #[test]
+    fn capture_path_allocations_per_frame() {
+        let mut framer = Framer::new(48_000, 2).unwrap();
+        let q = crate::DropOldest::new(50);
+        let chunk = vec![0.1f32; 960];
+        for _ in 0..200 {
+            for f in framer.push(&chunk) {
+                q.push(f);
+            }
+        }
+        let mut frames = 0u64;
+        let n = crate::alloc_count::count(|| {
+            for _ in 0..1_000 {
+                for f in framer.push(&chunk) {
+                    q.push(f);
+                    frames += 1;
+                }
+            }
+        });
+        println!(
+            "capture path: {n} allocs over {frames} frames = {:.2} per frame",
+            n as f64 / frames as f64
+        );
+        assert!(frames > 0);
     }
 }

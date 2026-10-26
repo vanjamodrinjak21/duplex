@@ -3,7 +3,15 @@ name = "gateway"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Opt-in candle Kokoro (any-tts), Metal or Accelerate CPU. Its `kokoro` feature pulls lindera with
+# `embed-ipadic`, whose build.rs downloads a Japanese dictionary from lindera.dev at BUILD time
+# (no runtime network) and cannot be switched off (any-tts hardcodes it). DOCS_RS=1 skips it but also
+# makes ort-sys skip linking, so it only works for check/clippy. Set LINDERA_CACHE=<dir> to download once.
+anytts = ["dep:any-tts"]
+
 [dependencies]
+any-tts = { version = "=0.2.0", optional = true, default-features = false, features = ["kokoro", "metal", "accelerate"] }
 anyhow.workspace = true
 cpal = "0.18.2"
 duplex-proto = { path = "../../proto" }

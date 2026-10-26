@@ -1,4 +1,4 @@
-//! Kokoro neural TTS: a blocking `Synth`, and a `Speaker` that plays it through a cpal output ring.
+//! Kokoro neural TTS (ort, or optionally candle via `any-tts`): a blocking `Synth`, and a `Speaker` that plays it through a cpal output ring.
 use std::future::Future;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -19,6 +19,13 @@ const RING_SECONDS: usize = 10;
 const POLL: Duration = Duration::from_millis(2);
 /// A few voices named in the invalid-voice error.
 const VOICE_HINT: &str = "af_heart, af_bella, am_adam, bf_emma";
+
+/// Warmup sentences, short to long.
+pub const WARMUP: [&str; 3] = [
+    "Hello.",
+    "Sure, I can help you with that right now.",
+    "Well, that depends on a few things, so let me walk you through the main options first, and then we can decide together which one fits best.",
+];
 
 /// Blocking, CPU-bound text-to-speech engine.
 pub trait Synth: Send + Sync + 'static {
@@ -62,6 +69,105 @@ impl Synth for KokoroSynth {
             Ok((samples, _)) => Ok(samples),
             Err(kokoro_en::KokoroError::VoiceNotFound(v)) => {
                 bail!("KOKORO_VOICE={v} is not in the voices file (try a name from the voices in KOKORO_VOICES, e.g. {VOICE_HINT})")
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// Default `ANYTTS_GAIN`: any-tts output is quieter than the ort path. The spike measured output RMS
+/// ort/any-tts on three sentences: 1.43, 1.46, 1.42 (mean 1.44). A measured starting point.
+const DEFAULT_ANYTTS_GAIN: f32 = 1.44;
+
+/// Compute device for the candle Kokoro (`ANYTTS_DEVICE`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnyTtsDevice {
+    Metal,
+    Cpu,
+}
+
+/// Parses `ANYTTS_DEVICE`; unset means Metal.
+pub fn parse_anytts_device(v: Option<&str>) -> anyhow::Result<AnyTtsDevice> {
+    match v {
+        None | Some("metal") => Ok(AnyTtsDevice::Metal),
+        Some("cpu") => Ok(AnyTtsDevice::Cpu),
+        Some(o) => bail!("ANYTTS_DEVICE={o} is not valid (use metal or cpu)"),
+    }
+}
+
+/// Parses `ANYTTS_GAIN`; unset means [`DEFAULT_ANYTTS_GAIN`].
+pub fn parse_anytts_gain(v: Option<&str>) -> anyhow::Result<f32> {
+    match v {
+        None => Ok(DEFAULT_ANYTTS_GAIN),
+        Some(s) => match s.parse::<f32>() {
+            Ok(g) if g.is_finite() && g > 0.0 => Ok(g),
+            _ => bail!("ANYTTS_GAIN={s} must be a number above 0"),
+        },
+    }
+}
+
+/// Kokoro-82M on candle through the `any-tts` crate (Metal or Accelerate CPU), local weights only.
+#[cfg(feature = "anytts")]
+pub struct AnyTtsSynth {
+    model: Box<dyn any_tts::traits::TtsModel>,
+    voice: String,
+    speed: f64,
+    gain: f32,
+}
+
+#[cfg(feature = "anytts")]
+impl AnyTtsSynth {
+    /// Blocking (loads the weights); call it off the async runtime threads.
+    pub fn new(
+        model_dir: &str,
+        device: AnyTtsDevice,
+        voice: &str,
+        speed: f32,
+        gain: f32,
+    ) -> anyhow::Result<Self> {
+        let device = match device {
+            AnyTtsDevice::Metal => any_tts::DeviceSelection::Metal(0),
+            AnyTtsDevice::Cpu => any_tts::DeviceSelection::Cpu,
+        };
+        let config = any_tts::TtsConfig::new(any_tts::ModelType::Kokoro)
+            .with_model_path(model_dir)
+            .with_device(device);
+        let model = any_tts::load_model(config)
+            .with_context(|| format!("load Kokoro weights from {model_dir}"))?;
+        Ok(Self {
+            model,
+            voice: voice.into(),
+            speed: speed.into(),
+            gain,
+        })
+    }
+}
+
+#[cfg(feature = "anytts")]
+impl Synth for AnyTtsSynth {
+    const SAMPLE_RATE: u32 = 24_000;
+
+    fn synth(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let req = any_tts::SynthesisRequest::new(text)
+            .with_voice(&self.voice)
+            .with_speed(self.speed);
+        match self.model.synthesize(&req) {
+            Ok(audio) => {
+                anyhow::ensure!(
+                    audio.sample_rate == Self::SAMPLE_RATE,
+                    "unexpected sample rate {}",
+                    audio.sample_rate
+                );
+                let mut x = audio.samples;
+                x.iter_mut()
+                    .for_each(|s| *s = (*s * self.gain).clamp(-1.0, 1.0));
+                Ok(x)
+            }
+            Err(any_tts::TtsError::UnknownVoice(v)) => {
+                bail!(
+                    "KOKORO_VOICE={} is not in ANYTTS_MODEL/voices ({v})",
+                    self.voice
+                )
             }
             Err(e) => Err(e.into()),
         }
@@ -202,14 +308,23 @@ impl<Y: Synth> KokoroSpeaker<Y> {
         Ok((speaker, stream))
     }
 
-    /// Synthesizes once so the first real sentence is not slow; logs the duration.
+    /// Synthesizes `WARMUP` sentences (short, medium, long) so kernels and shape-dependent buffers are warm
+    /// before the first real one; logs each stage and the total.
     pub async fn prewarm(&self) -> anyhow::Result<()> {
-        let t = Instant::now();
-        let synth = self.synth.clone();
-        tokio::task::spawn_blocking(move || synth.synth("Hello."))
-            .await
-            .context("prewarm task")??;
-        tracing::info!(ms = t.elapsed().as_millis() as u64, "kokoro prewarm");
+        let total = Instant::now();
+        for text in WARMUP {
+            let t = Instant::now();
+            let synth = self.synth.clone();
+            tokio::task::spawn_blocking(move || synth.synth(text))
+                .await
+                .context("prewarm task")??;
+            tracing::info!(
+                ms = t.elapsed().as_millis() as u64,
+                words = text.split_whitespace().count(),
+                "tts prewarm stage"
+            );
+        }
+        tracing::info!(ms = total.elapsed().as_millis() as u64, "tts prewarm");
         Ok(())
     }
 
@@ -327,6 +442,7 @@ impl<Y: Synth> Speaker for KokoroSpeaker<Y> {
 #[derive(Debug, PartialEq)]
 pub enum Tts {
     Kokoro,
+    AnyTts,
     Say,
 }
 
@@ -335,8 +451,9 @@ pub fn parse_tts(v: Option<&str>) -> anyhow::Result<Option<Tts>> {
     match v {
         None => Ok(None),
         Some("kokoro") => Ok(Some(Tts::Kokoro)),
+        Some("anytts") => Ok(Some(Tts::AnyTts)),
         Some("say") => Ok(Some(Tts::Say)),
-        Some(o) => bail!("TTS={o} is not valid (use kokoro or say)"),
+        Some(o) => bail!("TTS={o} is not valid (use kokoro, anytts or say)"),
     }
 }
 
@@ -344,11 +461,13 @@ pub fn parse_tts(v: Option<&str>) -> anyhow::Result<Option<Tts>> {
 pub enum AnySpeaker {
     Say(SaySpeaker),
     Kokoro(KokoroSpeaker<KokoroSynth>),
+    #[cfg(feature = "anytts")]
+    AnyTts(KokoroSpeaker<AnyTtsSynth>),
 }
 
 impl Speaker for AnySpeaker {
     fn lookahead(&self) -> bool {
-        matches!(self, Self::Kokoro(_))
+        !matches!(self, Self::Say(_))
     }
 
     fn speak(&self, text: String) -> impl Future<Output = ()> + Send {
@@ -356,6 +475,8 @@ impl Speaker for AnySpeaker {
         let f: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> = match self {
             Self::Say(s) => Box::pin(s.speak(text)),
             Self::Kokoro(k) => Box::pin(k.speak(text)),
+            #[cfg(feature = "anytts")]
+            Self::AnyTts(k) => Box::pin(k.speak(text)),
         };
         f
     }
@@ -364,6 +485,8 @@ impl Speaker for AnySpeaker {
         match self {
             Self::Say(s) => s.kill(),
             Self::Kokoro(k) => k.kill(),
+            #[cfg(feature = "anytts")]
+            Self::AnyTts(k) => k.kill(),
         }
     }
 }
@@ -527,15 +650,60 @@ mod tests {
         }
     }
 
+    /// Drives the real output callback body; the counter is per thread, so other tests cannot disturb it.
+    #[test]
+    fn fill_makes_zero_heap_allocations() {
+        let (mut prod, mut cons) = RingBuffer::<f32>::new(48_000);
+        let shared = Shared {
+            gen: 0.into(),
+            consumed: 0.into(),
+        };
+        let mut seen = 0;
+        let mut out = [0.0f32; 480];
+        let n = crate::alloc_count::count(|| {
+            for i in 0..2_000u64 {
+                if i % 3 != 2 {
+                    // Producer side runs on the synth task; only the callback is under test, but pushes are free too.
+                    if let Ok(c) = prod.write_chunk_uninit(300) {
+                        c.fill_from_iter(std::iter::repeat(0.1));
+                    }
+                }
+                if i == 1_000 {
+                    shared.gen.fetch_add(1, Ordering::Release); // kill() mid-playback
+                }
+                fill(&mut cons, &shared, &mut seen, &mut out); // i % 3 == 2 drains the ring: underrun path
+            }
+        });
+        assert_eq!(n, 0, "fill allocated");
+        assert!(shared.consumed.load(Ordering::Relaxed) > 0);
+    }
+
     #[test]
     fn tts_env_parsing() {
         assert_eq!(parse_tts(Some("kokoro")).unwrap(), Some(Tts::Kokoro));
+        assert_eq!(parse_tts(Some("anytts")).unwrap(), Some(Tts::AnyTts));
         assert_eq!(parse_tts(Some("say")).unwrap(), Some(Tts::Say));
         assert_eq!(parse_tts(None).unwrap(), None);
-        assert!(parse_tts(Some("piper"))
-            .unwrap_err()
-            .to_string()
-            .contains("TTS"));
+        let e = parse_tts(Some("piper")).unwrap_err().to_string();
+        assert!(e.contains("TTS") && e.contains("anytts"), "{e}");
+    }
+
+    #[test]
+    fn anytts_env_parsing() {
+        assert_eq!(parse_anytts_device(None).unwrap(), AnyTtsDevice::Metal);
+        assert_eq!(
+            parse_anytts_device(Some("metal")).unwrap(),
+            AnyTtsDevice::Metal
+        );
+        assert_eq!(parse_anytts_device(Some("cpu")).unwrap(), AnyTtsDevice::Cpu);
+        let e = parse_anytts_device(Some("gpu")).unwrap_err().to_string();
+        assert!(e.contains("ANYTTS_DEVICE"), "{e}");
+        assert_eq!(parse_anytts_gain(None).unwrap(), 1.44);
+        assert_eq!(parse_anytts_gain(Some("2")).unwrap(), 2.0);
+        for bad in ["0", "-1", "nan", "abc"] {
+            let e = parse_anytts_gain(Some(bad)).unwrap_err().to_string();
+            assert!(e.contains("ANYTTS_GAIN"), "{e}");
+        }
     }
 
     /// Needs the model files: `KOKORO_MODEL=... KOKORO_VOICES=... cargo test -p gateway -- --ignored --nocapture`.
@@ -580,5 +748,77 @@ mod tests {
         println!("wrote {}", path.display());
         let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(secs >= 1.0 && peak > 0.05, "secs={secs} peak={peak}");
+    }
+
+    /// Needs the weights: `ANYTTS_MODEL=/abs/Kokoro-82M cargo test --release -p gateway --features anytts -- --ignored --nocapture anytts`.
+    #[cfg(feature = "anytts")]
+    #[test]
+    #[ignore]
+    fn anytts_synthesizes_a_sentence() {
+        let model = std::env::var("ANYTTS_MODEL").expect("set ANYTTS_MODEL to the Kokoro-82M dir");
+        let device = parse_anytts_device(std::env::var("ANYTTS_DEVICE").ok().as_deref()).unwrap();
+        let voice = std::env::var("KOKORO_VOICE").unwrap_or_else(|_| "af_heart".into());
+        let gain = parse_anytts_gain(std::env::var("ANYTTS_GAIN").ok().as_deref()).unwrap();
+        let synth = AnyTtsSynth::new(&model, device, &voice, 1.0, gain).unwrap();
+        let text = "Hello there, how are you doing today?";
+        let _ = synth.synth(text).unwrap(); // warm-up
+        let t = Instant::now();
+        let samples = synth.synth(text).unwrap();
+        let took = t.elapsed();
+        let secs = samples.len() as f32 / AnyTtsSynth::SAMPLE_RATE as f32;
+        println!(
+            "synth {took:?} for {secs:.2}s audio, RTF {:.3}",
+            took.as_secs_f32() / secs
+        );
+        let path = std::env::temp_dir().join("anytts.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: AnyTtsSynth::SAMPLE_RATE,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for s in &samples {
+            w.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                .unwrap();
+        }
+        w.finalize().unwrap();
+        println!("wrote {}", path.display());
+        let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(secs >= 1.0 && peak > 0.05, "secs={secs} peak={peak}");
+    }
+
+    /// First-sentence latency after `ANYTTS_WARMUP_STAGES` (1 = old "Hello." only, 3 = all, default 3) warmup sentences.
+    #[cfg(feature = "anytts")]
+    #[test]
+    #[ignore]
+    fn anytts_first_sentence_latency() {
+        let model = std::env::var("ANYTTS_MODEL").expect("set ANYTTS_MODEL to the Kokoro-82M dir");
+        let device = parse_anytts_device(std::env::var("ANYTTS_DEVICE").ok().as_deref()).unwrap();
+        let stages: usize = std::env::var("ANYTTS_WARMUP_STAGES")
+            .map_or(3, |v| v.parse().expect("ANYTTS_WARMUP_STAGES"));
+        let t = Instant::now();
+        let synth = AnyTtsSynth::new(&model, device, "af_heart", 1.0, 1.44).unwrap();
+        println!("load {:?}", t.elapsed());
+        let t = Instant::now();
+        for text in &WARMUP[..stages] {
+            let s = Instant::now();
+            synth.synth(text).unwrap();
+            println!(
+                "warmup stage ({} words) {:?}",
+                text.split_whitespace().count(),
+                s.elapsed()
+            );
+        }
+        println!("warmup total {:?}", t.elapsed());
+        let t = Instant::now();
+        let x = synth
+            .synth("Hello there, how are you doing today?")
+            .unwrap();
+        println!(
+            "FIRST sentence ({:.2}s audio) {:?}",
+            x.len() as f32 / 24_000.0,
+            t.elapsed()
+        );
     }
 }
