@@ -8,6 +8,9 @@ anyhow.workspace = true
 cpal = "0.18.2"
 duplex-proto = { path = "../../proto" }
 hound = "3.5.1"
+kokoro-en = "0.1.5"
+# kokoro-en 0.1.5 does not compile against ort rc.14+.
+ort = "=2.0.0-rc.13"
 rtrb = "0.4.1"
 rubato = "0.15"
 tokio.workspace = true

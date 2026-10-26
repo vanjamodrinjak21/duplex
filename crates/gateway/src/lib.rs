@@ -1,6 +1,7 @@
 //! Gateway building blocks: lossy audio queue, energy VAD, sentence splitter.
 pub mod audio;
 pub mod session;
+pub mod tts;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

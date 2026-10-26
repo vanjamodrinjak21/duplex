@@ -18,8 +18,8 @@ See `AGENTS.md` for all environment variables.
 
 | Metric | Value |
 |---|---|
-| TTFA (end of speech to `say` started) | to be measured |
-| Barge-in (speech detected to `say` killed) | to be measured |
+| TTFA (end of speech to first audio (speaker started)) | to be measured |
+| Barge-in (speech detected to playback stopped) | to be measured |
 
 ## Measuring
 
@@ -31,7 +31,7 @@ WHISPER_MODEL=models/ggml-small.bin cargo run --release -p worker
 cargo run --release -p gateway | tee run.log
 ```
 
-Talk for a few turns, interrupting some replies, then stop with Ctrl-C. Each turn prints one stdout line: `ttfa_ms=` is end of speech to `say` started, and barged-in turns add `barge_in_ms=` (speech detected to `say` killed). Medians of both fields:
+Talk for a few turns, interrupting some replies, then stop with Ctrl-C. Each turn prints one stdout line: `ttfa_ms=` is end of speech to first audio (speaker started), and barged-in turns add `barge_in_ms=` (speech detected to playback stopped). Medians of both fields:
 
 ```sh
 for f in ttfa_ms barge_in_ms; do grep -o "$f=[0-9]*" run.log | cut -d= -f2 | sort -n | awk -v f=$f '{a[NR]=$1} END {if (NR) print f, (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2), "n=" NR}'; done
@@ -42,5 +42,6 @@ Paste the medians into the Results table above.
 ## Limitations
 
 - Headphones required: there is no echo cancellation, so speaker output would trigger barge-in.
-- `say` starts per sentence as a new process, which adds its own startup latency to TTFA.
+- With `TTS=say`, `say` starts per sentence as a new process, which adds its own startup latency to TTFA.
+- If Kokoro fails on one sentence, that sentence is skipped with a warning on stderr (a silent gap).
 - Ollama serialises requests by default, so concurrent sessions queue behind each other.

@@ -1,6 +1,7 @@
 //! Session loop: VAD-gated audio streaming, sentence TTS, barge-in, health-gated reconnect.
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -27,6 +28,10 @@ pub trait Speaker: Send + Sync + 'static {
     fn speak(&self, text: String) -> impl Future<Output = ()> + Send;
     /// Stops the sentence being spoken now.
     fn kill(&self);
+    /// True if the next sentence may be handed over while the current one is still being spoken.
+    fn lookahead(&self) -> bool {
+        false
+    }
 }
 
 /// macOS `say`, one child process per sentence.
@@ -145,7 +150,7 @@ pub async fn run<F: FrameSource, S: Speaker>(
     }
 }
 
-enum Played {
+pub(crate) enum Played {
     Started {
         turn: u64,
         text: String,
@@ -156,30 +161,57 @@ enum Played {
     },
 }
 
-/// Speaks queued sentences one at a time, skipping any whose turn was barged in.
-async fn player<S: Speaker>(
+/// A sentence handed to the speaker: its future, plus what `Started` reports once it is the one playing.
+struct Queued<'a> {
+    turn: u64,
+    text: String,
+    fut: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+}
+
+/// Speaks queued sentences in order, skipping any whose turn was barged in.
+/// With `lookahead` the next sentence is handed over while the current one plays,
+/// but `Started` is only sent when it becomes the current one.
+pub(crate) async fn player<S: Speaker>(
     speaker: Arc<S>,
     mut rx: mpsc::Receiver<(u64, String)>,
     current: Arc<AtomicU64>,
     ev: mpsc::Sender<Played>,
 ) {
-    while let Some((turn, text)) = rx.recv().await {
-        if turn != current.load(Ordering::Acquire) {
-            continue;
+    let limit = if speaker.lookahead() { 2 } else { 1 };
+    let started = |q: &Queued| Played::Started {
+        turn: q.turn,
+        text: q.text.clone(),
+        at: Instant::now(),
+    };
+    let mut active: VecDeque<Queued> = VecDeque::new();
+    let mut closed = false;
+    while !closed || !active.is_empty() {
+        tokio::select! {
+            biased;
+            () = async { active.front_mut().unwrap().fut.as_mut().await }, if !active.is_empty() => {
+                let done = active.pop_front().unwrap();
+                let _ = ev.send(Played::Finished { turn: done.turn }).await;
+                if let Some(q) = active.front() {
+                    if ev.send(started(q)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            m = rx.recv(), if !closed && active.len() < limit => {
+                let Some((turn, text)) = m else {
+                    closed = true;
+                    continue;
+                };
+                if turn != current.load(Ordering::Acquire) {
+                    continue;
+                }
+                let q = Queued { turn, text: text.clone(), fut: Box::pin(speaker.speak(text)) };
+                if active.is_empty() && ev.send(started(&q)).await.is_err() {
+                    return;
+                }
+                active.push_back(q);
+            }
         }
-        if ev
-            .send(Played::Started {
-                turn,
-                text: text.clone(),
-                at: Instant::now(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        speaker.speak(text).await;
-        let _ = ev.send(Played::Finished { turn }).await;
     }
 }
 
@@ -196,7 +228,7 @@ fn audio(turn_id: u64, seq: u64, frame: &[i16]) -> ClientMsg {
 }
 
 /// Logs `ms` inside a span opened at `t`.
-fn close(span: Option<(Span, Instant)>) {
+pub(crate) fn close(span: Option<(Span, Instant)>) {
     if let Some((s, t)) = span {
         s.in_scope(|| tracing::info!(ms = t.elapsed().as_millis() as u64, "span closed"));
     }
@@ -421,5 +453,47 @@ mod tests {
     fn backoff_doubles_and_caps() {
         let ms: Vec<u128> = (0..8).map(|n| backoff(n).as_millis()).collect();
         assert_eq!(ms, [100, 200, 400, 800, 1600, 2000, 2000, 2000]);
+    }
+
+    /// Speaker whose `speak` records when it is called and then "plays" for 200 ms.
+    struct Slow(std::sync::Mutex<Vec<Instant>>);
+
+    impl Speaker for Slow {
+        fn speak(&self, _text: String) -> impl Future<Output = ()> + Send {
+            self.0.lock().unwrap().push(Instant::now());
+            tokio::time::sleep(Duration::from_millis(200))
+        }
+        fn kill(&self) {}
+        fn lookahead(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn player_hands_over_next_sentence_early_but_starts_it_late() {
+        let sp = Arc::new(Slow(Default::default()));
+        let (tx, rx) = mpsc::channel(8);
+        let (ev_tx, mut ev_rx) = mpsc::channel(8);
+        tokio::spawn(player(sp.clone(), rx, Arc::new(AtomicU64::new(0)), ev_tx));
+        tx.send((0, "one".into())).await.unwrap();
+        tx.send((0, "two".into())).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(sp.0.lock().unwrap().len(), 2, "speak called for both");
+        let mut seen = Vec::new();
+        while let Ok(e) = ev_rx.try_recv() {
+            seen.push(match e {
+                Played::Started { text, .. } => format!("start {text}"),
+                Played::Finished { .. } => "finish".into(),
+            });
+        }
+        assert_eq!(seen, ["start one"], "two has not started playing yet");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let Some(Played::Finished { .. }) = ev_rx.recv().await else {
+            panic!("expected finish")
+        };
+        let Some(Played::Started { text, .. }) = ev_rx.recv().await else {
+            panic!("expected start")
+        };
+        assert_eq!(text, "two");
     }
 }

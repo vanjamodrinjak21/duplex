@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Context;
 use gateway::audio::{start_mic, FakeMic};
 use gateway::session::{run, SaySpeaker};
+use gateway::tts::{parse_tts, AnySpeaker, KokoroSpeaker, KokoroSynth, Tts};
 use gateway::{DropOldest, DEFAULT_VAD_THRESHOLD};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -14,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ort=warn")),
         )
         .init();
     let addr = std::env::var("WORKER_ADDR").unwrap_or_else(|_| "http://127.0.0.1:50051".into());
@@ -24,7 +25,8 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("VAD_THRESHOLD={v} is not a number"))?,
         Err(_) => DEFAULT_VAD_THRESHOLD,
     };
-    let speaker = Arc::new(SaySpeaker::new(std::env::var("SAY_VOICE").ok()));
+    let (speaker, _speaker_stream) = pick_speaker().await?;
+    let speaker = Arc::new(speaker);
     let shutdown = CancellationToken::new();
     tokio::spawn({
         let s = shutdown.clone();
@@ -64,4 +66,42 @@ async fn main() -> anyhow::Result<()> {
         "shutdown"
     );
     Ok(())
+}
+
+/// Chooses the speaker from `TTS`: Kokoro when its files exist (the default), else `say`.
+async fn pick_speaker() -> anyhow::Result<(AnySpeaker, Option<cpal::Stream>)> {
+    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+    let say = || AnySpeaker::Say(SaySpeaker::new(std::env::var("SAY_VOICE").ok()));
+    let want = parse_tts(std::env::var("TTS").ok().as_deref())?;
+    if want == Some(Tts::Say) {
+        tracing::info!("tts=say");
+        return Ok((say(), None));
+    }
+    let model = env("KOKORO_MODEL", "models/kokoro-v1.0.int8.onnx");
+    let voices = env("KOKORO_VOICES", "models/voices");
+    if let Some(missing) = [&model, &voices]
+        .into_iter()
+        .find(|p| !std::path::Path::new(p.as_str()).exists())
+    {
+        anyhow::ensure!(
+            want.is_none(),
+            "TTS=kokoro but {missing} is missing (see AGENTS.md for the download commands)"
+        );
+        tracing::warn!("{missing} not found; using say instead of Kokoro (see AGENTS.md; paths are relative to the cwd)");
+        tracing::info!("tts=say");
+        return Ok((say(), None));
+    }
+    let speed = match std::env::var("KOKORO_SPEED") {
+        Ok(v) => match v.parse::<f32>() {
+            Ok(x) if x.is_finite() && x > 0.0 => x,
+            _ => anyhow::bail!("KOKORO_SPEED={v} must be a number above 0"),
+        },
+        Err(_) => 1.0,
+    };
+    let voice = env("KOKORO_VOICE", "af_heart");
+    let synth = KokoroSynth::new(&model, &voices, &voice, speed).await?;
+    let (speaker, stream) = KokoroSpeaker::start(synth)?;
+    speaker.prewarm().await?;
+    tracing::info!(%voice, speed, "tts=kokoro");
+    Ok((AnySpeaker::Kokoro(speaker), Some(stream)))
 }
